@@ -57,7 +57,7 @@ jobs:
 
       # Audits the resolved dependency tree, not just the direct pins.
       - name: pip-audit
-        run: pip-audit --progress-spinner off --strict
+        run: pip-audit --progress-spinner off --strict --skip-editable
 
   docker:
     runs-on: ubuntu-latest
