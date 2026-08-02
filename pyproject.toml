@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest==9.1.1", "ruff==0.8.6"]
+dev = ["pytest==9.1.1", "ruff==0.16.0"]
 
 [project.scripts]
 netgear-plus-exporter = "netgear_plus_exporter.__main__:main"
