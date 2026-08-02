@@ -158,6 +158,12 @@ ruff check .
 pytest
 ```
 
+## Support
+
+If this saved you some time, you can sponsor the work:
+
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=github-sponsors&logoColor=white)](https://github.com/sponsors/dimidur)
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
