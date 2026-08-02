@@ -19,7 +19,7 @@ classifiers = [
 ]
 dependencies = [
   "py-netgear-plus==0.6.4",
-  "prometheus-client==0.21.1",
+  "prometheus-client==0.26.0",
 ]
 
 [project.optional-dependencies]
