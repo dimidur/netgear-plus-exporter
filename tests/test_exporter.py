@@ -135,3 +135,18 @@ def test_port_count_is_inferred_when_connector_does_not_report_it():
     reading = {"infos": _infos(), "raw": None, "ports": 0, "model": "", "duration": 1.0}
     families = _collect(reading)
     assert len(families["netgear_plus_port_up"].samples) == PORTS
+
+
+def test_upstream_private_entry_point_still_exists():
+    """Guards the one binding to a non-public upstream API.
+
+    Unrounded counters and per-port CRC both come from
+    NetgearSwitchConnector._get_port_statistics(). If a py-netgear-plus release
+    renames or removes it, the exporter silently degrades to rounded megabyte
+    values and partial CRC -- which is exactly the failure this project exists
+    to avoid, and it is invisible without a switch to test against. This catches
+    the rename in CI, with no hardware.
+    """
+    import py_netgear_plus
+
+    assert hasattr(py_netgear_plus.NetgearSwitchConnector, "_get_port_statistics")

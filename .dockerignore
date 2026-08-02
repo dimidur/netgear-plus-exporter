@@ -1,0 +1,21 @@
+# Keep the build context small. Without this the local .venv (~60 MB) and .git
+# are uploaded to the daemon on every build, which dwarfs the image itself.
+# README.md is deliberately NOT excluded — pyproject.toml declares it as the
+# project readme, so the build fails without it.
+.git
+.github
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+.pytest_cache
+.ruff_cache
+.coverage
+tests
+.base-image-digest
+.gitignore
+.dockerignore
+LICENSE
