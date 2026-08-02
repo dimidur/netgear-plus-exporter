@@ -8,7 +8,7 @@ import signal
 import sys
 import time
 
-from prometheus_client import REGISTRY, start_http_server
+from prometheus_client import CollectorRegistry, generate_latest, start_http_server
 
 from .exporter import NetgearSwitchCollector, NetgearSwitchScraper, read_password
 
@@ -41,9 +41,18 @@ def main() -> int:
         name=os.environ.get("NETGEAR_EXPORTER_NAME") or host,
         cache_seconds=_env_float("NETGEAR_EXPORTER_CACHE_SECONDS", 30.0),
     )
-    REGISTRY.register(NetgearSwitchCollector(scraper))
+    # A private registry, not the global default one: keeps the output to this
+    # exporter's own metrics with no process/GC collectors mixed in.
+    registry = CollectorRegistry()
+    registry.register(NetgearSwitchCollector(scraper))
 
-    start_http_server(listen_port)
+    # --once: scrape, print the exposition to stdout, exit. Lets you verify a
+    # switch without running a server, and gives CI a smoke test.
+    if "--once" in sys.argv:
+        sys.stdout.write(generate_latest(registry).decode())
+        return 0
+
+    start_http_server(listen_port, registry=registry)
     _LOGGER.info("serving metrics for %s on :%d", scraper.name, listen_port)
 
     # The exporter is entirely pull-driven; idle until told to stop. Handling

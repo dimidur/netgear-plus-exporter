@@ -75,10 +75,16 @@ class NetgearSwitchScraper:
         caller degrades to the rounded values instead of crashing.
         """
         try:
-            page = connector.fetch_page(connector.switch_model.PORT_STATISTICS)
-            parsed = connector._parser.parse_port_statistics(page, connector.ports)  # noqa: SLF001
+            # Single upstream entry point: it picks the HTML or JSON-API path per
+            # model and returns the parser output before any megabyte rounding.
+            parsed = connector._get_port_statistics()  # noqa: SLF001
         except Exception:  # noqa: BLE001 - any upstream change must not be fatal
-            _LOGGER.debug("raw parser path unavailable for %s", self.host, exc_info=True)
+            _LOGGER.warning(
+                "raw counter path unavailable for %s; falling back to rounded "
+                "megabyte values (netgear_plus_raw_counters=0)",
+                self.host,
+                exc_info=True,
+            )
             return None
         if not isinstance(parsed, dict):
             return None
