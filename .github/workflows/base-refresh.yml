@@ -1,0 +1,157 @@
+name: base-refresh
+
+# Rebuild and republish when the BASE IMAGE moves, not when this code changes.
+#
+# A published image is only as secure as the base it was built on, and that base
+# gets patched independently of this repository. Left alone, a release slowly
+# rots: the code is fine, the OS underneath it is not.
+#
+# Guarded by two conditions so it does not chase every upstream push:
+#   * a grace period, because a brand-new base tag is the least-tested one
+#   * a clean Docker Scout scan, so this never publishes a base that is worse
+#     than the one already shipped
+#
+# The digest last built from is tracked in .base-image-digest.
+
+on:
+  schedule:
+    - cron: "0 4 * * 1" # Mondays, 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      ignore_grace:
+        description: "Rebuild even if the base is newer than the grace period"
+        type: boolean
+        default: false
+
+env:
+  BASE_IMAGE: python:3.13-alpine
+  GRACE_DAYS: "7"
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Hashing the raw manifest index rather than using --format: the template
+      # is silently ignored by older buildx builds, which then print the whole
+      # inspect output and poison the comparison. Hashing the raw bytes is what
+      # the digest IS, so it cannot drift with the CLI version.
+      - name: Resolve the current base image digest
+        id: base
+        run: |
+          digest="sha256:$(docker buildx imagetools inspect "$BASE_IMAGE" --raw \
+                            | sha256sum | cut -d' ' -f1)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "current base digest: $digest"
+
+      - name: Compare against the digest we last built from
+        id: compare
+        run: |
+          previous=$(cat .base-image-digest 2>/dev/null || echo "none")
+          echo "previously built from: $previous"
+          if [ "$previous" = "${{ steps.base.outputs.digest }}" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Base image unchanged — nothing to do."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A tag that moved an hour ago is the least-proven version of itself.
+      # Waiting lets upstream pull a bad push before we bake it into a release.
+      - name: Enforce the grace period
+        id: grace
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          tag="${BASE_IMAGE#*:}"
+          repo="${BASE_IMAGE%%:*}"
+          updated=$(curl -fsSL \
+            "https://hub.docker.com/v2/repositories/library/$repo/tags/$tag" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["last_updated"])')
+          age_days=$(python3 - "$updated" <<'PY'
+          import sys, datetime
+          then = datetime.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+          now = datetime.datetime.now(datetime.timezone.utc)
+          print((now - then).days)
+          PY
+          )
+          echo "base tag last updated $updated ($age_days days ago)"
+          if [ "${{ inputs.ignore_grace }}" = "true" ]; then
+            echo "grace period overridden by manual dispatch"
+          elif [ "$age_days" -lt "$GRACE_DAYS" ]; then
+            echo "only $age_days days old, grace period is $GRACE_DAYS — deferring."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        if: steps.grace.outputs.proceed == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # The whole point of the rebuild is a cleaner base. If the new one carries
+      # critical or high findings, publishing it would make things worse, so the
+      # run stops and the existing release stays as it is.
+      - name: Refuse to publish a base with critical or high CVEs
+        if: steps.grace.outputs.proceed == 'true'
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: ${{ env.BASE_IMAGE }}
+          only-severities: critical,high
+          exit-code: true
+
+      - name: Bump the patch version and record the digest
+        id: bump
+        if: steps.grace.outputs.proceed == 'true'
+        run: |
+          current=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          next=$(python3 - "$current" <<'PY'
+          import sys
+          major, minor, patch = sys.argv[1].split(".")
+          print(f"{major}.{minor}.{int(patch) + 1}")
+          PY
+          )
+          echo "version $current -> $next"
+          sed -i "0,/^version = \".*\"/s//version = \"$next\"/" pyproject.toml
+          sed -i "s/^__version__ = \".*\"/__version__ = \"$next\"/" netgear_plus_exporter/__init__.py
+          echo "${{ steps.base.outputs.digest }}" > .base-image-digest
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and tag
+        if: steps.grace.outputs.proceed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml netgear_plus_exporter/__init__.py .base-image-digest
+          git commit -m "build: rebuild on refreshed ${BASE_IMAGE}
+
+          Base digest ${{ steps.base.outputs.digest }} is newer than the one the
+          last release was built from, is past the ${GRACE_DAYS}-day grace period,
+          and reports no critical or high CVEs."
+          git tag "v${{ steps.bump.outputs.version }}"
+          git push origin HEAD:main --follow-tags
+
+      - uses: docker/setup-qemu-action@v3
+        if: steps.grace.outputs.proceed == 'true'
+      - uses: docker/setup-buildx-action@v3
+        if: steps.grace.outputs.proceed == 'true'
+
+      # Built here rather than by letting the tag trigger release.yml: pushes
+      # made with GITHUB_TOKEN deliberately do not start other workflows, so a
+      # tag pushed above would never fire it.
+      - name: Build and publish
+        if: steps.grace.outputs.proceed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          no-cache: true # a refreshed base is the entire reason for this run
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/netgear-plus-exporter:${{ steps.bump.outputs.version }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/netgear-plus-exporter:latest
