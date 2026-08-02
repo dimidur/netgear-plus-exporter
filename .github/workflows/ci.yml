@@ -56,8 +56,12 @@ jobs:
         run: bandit -q -r netgear_plus_exporter
 
       # Audits the resolved dependency tree, not just the direct pins.
+      # --skip-editable: the project installs itself with `pip install -e`
+      # and is not on PyPI, so it cannot be audited. Not --strict, because
+      # under --strict that unavoidable skip is itself a failure; without
+      # it, a real advisory still exits non-zero.
       - name: pip-audit
-        run: pip-audit --progress-spinner off --strict --skip-editable
+        run: pip-audit --progress-spinner off --skip-editable
 
   docker:
     runs-on: ubuntu-latest
