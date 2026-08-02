@@ -11,6 +11,11 @@ name: base-refresh
 #   * a clean Docker Scout scan, so this never publishes a base that is worse
 #     than the one already shipped
 #
+# Opens a PULL REQUEST rather than pushing to main: main requires status
+# checks, and a freshly pushed commit has none. The PR runs CI like any
+# other change. Merging it does not publish -- tag the version afterwards
+# and the release workflow does that.
+#
 # The digest last built from is tracked in .base-image-digest.
 
 on:
@@ -32,6 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v7
 
@@ -122,36 +128,24 @@ jobs:
           echo "${{ steps.base.outputs.digest }}" > .base-image-digest
           echo "version=$next" >> "$GITHUB_OUTPUT"
 
-      - name: Commit and tag
+      - name: Open a pull request with the bump
         if: steps.grace.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          branch="base-refresh/${{ steps.bump.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
           git add pyproject.toml netgear_plus_exporter/__init__.py .base-image-digest
-          git commit -m "build: rebuild on refreshed ${BASE_IMAGE}
+          git commit -m "build: rebuild on refreshed ${BASE_IMAGE}" \
+                     -m "Base digest ${{ steps.base.outputs.digest }} is newer than the one the last release was built from, is past the ${GRACE_DAYS}-day grace period, and reports no critical or high CVEs."
+          git push origin "$branch"
+          gh pr create \
+            --base main --head "$branch" \
+            --title "build: rebuild on refreshed ${BASE_IMAGE} (${{ steps.bump.outputs.version }})" \
+            --body "The base image moved, is past the ${GRACE_DAYS}-day grace period and scans clean.
 
-          Base digest ${{ steps.base.outputs.digest }} is newer than the one the
-          last release was built from, is past the ${GRACE_DAYS}-day grace period,
-          and reports no critical or high CVEs."
-          git tag "v${{ steps.bump.outputs.version }}"
-          git push origin HEAD:main --follow-tags
+          Digest \`${{ steps.base.outputs.digest }}\`.
 
-      - uses: docker/setup-qemu-action@v3
-        if: steps.grace.outputs.proceed == 'true'
-      - uses: docker/setup-buildx-action@v4
-        if: steps.grace.outputs.proceed == 'true'
-
-      # Built here rather than by letting the tag trigger release.yml: pushes
-      # made with GITHUB_TOKEN deliberately do not start other workflows, so a
-      # tag pushed above would never fire it.
-      - name: Build and publish
-        if: steps.grace.outputs.proceed == 'true'
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          no-cache: true # a refreshed base is the entire reason for this run
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/netgear-plus-exporter:${{ steps.bump.outputs.version }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/netgear-plus-exporter:latest
+          Merging this does not publish anything: tag \`v${{ steps.bump.outputs.version }}\` afterwards and the release workflow builds and pushes the image."
