@@ -17,8 +17,10 @@ data:
 
 1. **Unrounded counters.** `py_netgear_plus.get_switch_infos()` reports traffic
    as megabytes via `round(bytes * 1e-6, 2)` — quantised to 10 kB. On a quiet
-   link that destroys `rate()`. This exporter reads the library's *parser* layer,
-   which returns the raw integers the switch actually reported.
+   link that destroys `rate()`. This exporter reads the parser layer underneath
+   it, which returns the raw integers the switch actually reported, and falls
+   back to the rounded values only if that path is unavailable — reporting which
+   one it used as `netgear_plus_raw_counters`.
 2. **CRC errors on every port.** The library's public dict drops most of them on
    the way out; the parser returns one value per port. CRC is the single most
    useful metric these switches expose — a rising count means a bad cable,
@@ -73,7 +75,7 @@ docker run --rm -p 9694:9694 \
   -e NETGEAR_EXPORTER_HOST=192.168.1.2 \
   -e NETGEAR_EXPORTER_PASSWORD=secret \
   -e NETGEAR_EXPORTER_NAME=basement-switch \
-  ghcr.io/dimidur/netgear-plus-exporter:0.1.0
+  dimidur/netgear-plus-exporter:0.1.0
 ```
 
 Compose, reading the password from a file so it never appears in `docker inspect`:
@@ -81,7 +83,7 @@ Compose, reading the password from a file so it never appears in `docker inspect
 ```yaml
 services:
   switch-exporter:
-    image: ghcr.io/dimidur/netgear-plus-exporter:0.1.0
+    image: dimidur/netgear-plus-exporter:0.1.0
     restart: unless-stopped
     environment:
       NETGEAR_EXPORTER_HOST: 192.168.1.2
@@ -100,6 +102,20 @@ scrape_configs:
     static_configs:
       - targets: ["switch-exporter:9694"]
 ```
+
+### Checking a switch without running a server
+
+`--once` scrapes, prints the exposition to stdout and exits — useful for
+verifying credentials and parser compatibility against a new model:
+
+```bash
+NETGEAR_EXPORTER_HOST=192.168.1.2 NETGEAR_EXPORTER_PASSWORD=secret \
+  netgear-plus-exporter --once
+```
+
+Check `netgear_plus_raw_counters` in the output: **1** means the unrounded
+counter path works on your switch, **0** means it fell back to rescaled megabyte
+values and CRC data will be incomplete.
 
 ## Useful queries
 
