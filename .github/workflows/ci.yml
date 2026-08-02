@@ -50,18 +50,33 @@ jobs:
         with:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip
-      - run: pip install -e '.[dev]'
+
+      # The declared dependency set, taken from pyproject so the pins live in
+      # exactly one place. The project itself is deliberately NOT installed
+      # here -- see the pip-audit step.
+      - name: collect declared requirements
+        run: |
+          python - <<'PY' > requirements-audit.txt
+          import tomllib
+          d = tomllib.load(open("pyproject.toml", "rb"))
+          for req in d["project"]["dependencies"]:
+              print(req)
+          for req in d["project"]["optional-dependencies"]["dev"]:
+              print(req)
+          PY
+          cat requirements-audit.txt
+      - run: pip install -r requirements-audit.txt
 
       - name: bandit
         run: bandit -q -r netgear_plus_exporter
 
-      # Audits the resolved dependency tree, not just the direct pins.
-      # --skip-editable: the project installs itself with `pip install -e`
-      # and is not on PyPI, so it cannot be audited. Not --strict, because
-      # under --strict that unavoidable skip is itself a failure; without
-      # it, a real advisory still exits non-zero.
+      # --strict fails the audit if ANY dependency cannot be collected, which
+      # is the whole value: a silently unaudited dependency is worse than a
+      # reported one. Auditing this environment instead would always trip it
+      # on the project's own editable install -- not on PyPI, uncollectable --
+      # so the declared requirements are audited directly.
       - name: pip-audit
-        run: pip-audit --progress-spinner off --skip-editable
+        run: pip-audit --progress-spinner off --strict -r requirements-audit.txt
 
   docker:
     runs-on: ubuntu-latest
