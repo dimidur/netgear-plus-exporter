@@ -17,14 +17,14 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: ${{ matrix.python-version }}
+          # Single version on purpose: this is distributed as a container
+          # built on python:3.13-alpine and is not published to PyPI, so a
+          # 3.11/3.12 matrix tested a configuration nobody runs.
+          python-version: "3.13"
       - run: python -m pip install --upgrade pip
       - run: pip install -e '.[dev]'
 
@@ -80,7 +80,10 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
-    needs: test
+    # Both gates, not just test: building and scanning an image whose
+    # dependencies just failed an audit wastes minutes and publishes a
+    # green-looking docker job next to a red security one.
+    needs: [test, security]
     steps:
       - uses: actions/checkout@v7
       - run: docker build -t netgear-plus-exporter:ci .
