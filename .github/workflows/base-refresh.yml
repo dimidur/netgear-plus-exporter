@@ -146,7 +146,7 @@ jobs:
       # tag pushed above would never fire it.
       - name: Build and publish
         if: steps.grace.outputs.proceed == 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
