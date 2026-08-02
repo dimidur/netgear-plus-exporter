@@ -7,6 +7,7 @@ import os
 import signal
 import sys
 import time
+from types import FrameType
 
 from prometheus_client import CollectorRegistry, generate_latest, start_http_server
 
@@ -59,7 +60,7 @@ def main() -> int:
     # SIGTERM explicitly keeps `docker stop` from taking the full 10s grace.
     stopping = False
 
-    def _stop(signum, _frame):  # noqa: ANN001, ANN202
+    def _stop(signum: int, _frame: FrameType | None) -> None:
         nonlocal stopping
         _LOGGER.info("signal %s received, shutting down", signum)
         stopping = True

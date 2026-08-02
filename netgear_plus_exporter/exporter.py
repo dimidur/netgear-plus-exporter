@@ -25,10 +25,11 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import py_netgear_plus
-from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 from prometheus_client.registry import Collector
 
 _LOGGER = logging.getLogger(__name__)
@@ -119,9 +120,7 @@ class NetgearSwitchScraper:
                 "infos": infos,
                 "raw": self._raw_port_statistics(self._connector),
                 "ports": int(getattr(self._connector, "ports", 0) or 0),
-                "model": getattr(
-                    getattr(self._connector, "switch_model", None), "MODEL_NAME", ""
-                ),
+                "model": getattr(getattr(self._connector, "switch_model", None), "MODEL_NAME", ""),
                 "duration": time.monotonic() - started,
             }
             self._cached = reading
@@ -135,7 +134,7 @@ class NetgearSwitchCollector(Collector):
     def __init__(self, scraper: NetgearSwitchScraper) -> None:
         self.scraper = scraper
 
-    def collect(self):  # noqa: ANN201 - prometheus_client's expected signature
+    def collect(self) -> Iterator[Metric]:
         switch = self.scraper.name
         up = GaugeMetricFamily(
             "netgear_plus_up",
@@ -155,7 +154,7 @@ class NetgearSwitchCollector(Collector):
         yield from self._describe(reading, switch)
         yield from self._ports(reading, switch)
 
-    def _describe(self, reading: dict[str, Any], switch: str):  # noqa: ANN202
+    def _describe(self, reading: dict[str, Any], switch: str) -> Iterator[Metric]:
         infos = reading["infos"]
 
         duration = GaugeMetricFamily(
@@ -203,7 +202,7 @@ class NetgearSwitchCollector(Collector):
         )
         yield info
 
-    def _ports(self, reading: dict[str, Any], switch: str):  # noqa: ANN202, C901
+    def _ports(self, reading: dict[str, Any], switch: str) -> Iterator[Metric]:  # noqa: C901
         infos = reading["infos"]
         raw = reading["raw"]
         ports = reading["ports"] or self._infer_port_count(infos)
@@ -278,6 +277,7 @@ class NetgearSwitchCollector(Collector):
         """Prefer unrounded parser values; fall back to rescaled megabytes."""
         if raw is not None:
             position = index - 1
+
             def at(key: str) -> float | None:
                 values = raw.get(key) or []
                 return float(values[position]) if position < len(values) else None
