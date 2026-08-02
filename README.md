@@ -158,6 +158,12 @@ ruff check .
 pytest
 ```
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Note that **model support lives
+upstream** in [`py-netgear-plus`](https://github.com/foxey/py-netgear-plus) — if
+your switch isn't recognised, that's the place to add it.
+
 ## Support
 
 If this saved you some time, you can sponsor the work:
