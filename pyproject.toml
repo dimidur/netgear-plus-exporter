@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netgear-plus-exporter"
+version = "0.1.0"
+description = "Prometheus exporter for NETGEAR Plus / Easy Smart Managed switches (no SNMP required)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["prometheus", "exporter", "netgear", "switch", "monitoring", "snmp-less"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Monitoring",
+]
+dependencies = [
+  "py-netgear-plus==0.6.4",
+  "prometheus-client==0.21.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.4", "ruff==0.8.6"]
+
+[project.scripts]
+netgear-plus-exporter = "netgear_plus_exporter.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["netgear_plus_exporter*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "ANN", "BLE", "SLF"]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN", "SLF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

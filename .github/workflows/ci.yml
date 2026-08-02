@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e '.[dev]'
+      - run: ruff check .
+      - run: pytest -q
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Build only — publishing is wired up when the repository goes public.
+      - run: docker build -t netgear-plus-exporter:ci .
+      - name: Container starts and rejects missing config
+        run: |
+          set +e
+          out=$(docker run --rm netgear-plus-exporter:ci 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          test $code -eq 2 || { echo "expected exit 2 without NETGEAR_EXPORTER_HOST"; exit 1; }
