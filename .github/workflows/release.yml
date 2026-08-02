@@ -6,7 +6,16 @@ on:
   workflow_dispatch:
 
 jobs:
+  # A tag push previously published straight away, running no checks at all:
+  # tagging a broken commit, or tagging while main was red, shipped it. The
+  # full gate suite now runs against the tagged tree first.
+  verify:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   publish:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read

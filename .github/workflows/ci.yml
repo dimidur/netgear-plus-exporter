@@ -10,6 +10,9 @@ on:
   schedule:
     - cron: "0 5 * * 1"
   workflow_dispatch:
+  # Callable so the release workflow can require these gates against the
+  # exact tagged tree before anything is published.
+  workflow_call:
 
 permissions:
   contents: read
