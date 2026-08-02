@@ -33,7 +33,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Hashing the raw manifest index rather than using --format: the template
       # is silently ignored by older buildx builds, which then print the whole
