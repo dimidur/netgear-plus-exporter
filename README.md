@@ -125,7 +125,7 @@ docker run --rm -p 9694:9694 \
   -e NETGEAR_EXPORTER_HOST=192.168.1.2 \
   -e NETGEAR_EXPORTER_PASSWORD=secret \
   -e NETGEAR_EXPORTER_NAME=basement-switch \
-  dimidur/netgear-plus-exporter:0.2.0
+  dimidur/netgear-plus-exporter:0.1.1
 ```
 
 Compose, reading the password from a file so it never appears in `docker inspect`:
@@ -133,7 +133,7 @@ Compose, reading the password from a file so it never appears in `docker inspect
 ```yaml
 services:
   switch-exporter:
-    image: dimidur/netgear-plus-exporter:0.2.0
+    image: dimidur/netgear-plus-exporter:0.1.1
     restart: unless-stopped
     environment:
       NETGEAR_EXPORTER_HOST: 192.168.1.2
