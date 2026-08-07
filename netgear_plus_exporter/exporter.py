@@ -79,7 +79,7 @@ class NetgearSwitchScraper:
             # Single upstream entry point: it picks the HTML or JSON-API path per
             # model and returns the parser output before any megabyte rounding.
             parsed = connector._get_port_statistics()  # noqa: SLF001
-        except Exception:  # noqa: BLE001 - any upstream change must not be fatal
+        except Exception:
             _LOGGER.warning(
                 "raw counter path unavailable for %s; falling back to rounded "
                 "megabyte values (netgear_plus_raw_counters=0)",
@@ -90,9 +90,9 @@ class NetgearSwitchScraper:
         if not isinstance(parsed, dict):
             return None
         wanted = ("sum_rx", "sum_tx", "crc_errors")
-        if not all(isinstance(parsed.get(k), list) for k in wanted):
+        if not all(isinstance(parsed.get(key), list) for key in wanted):
             return None
-        return {k: [int(v or 0) for v in parsed[k]] for k in wanted}
+        return {key: [int(value or 0) for value in parsed[key]] for key in wanted}
 
     def scrape(self) -> dict[str, Any]:
         """Return a reading, reusing the cache while it is fresh."""
@@ -106,9 +106,12 @@ class NetgearSwitchScraper:
                 self._connector = self._connect()
             try:
                 infos = self._connector.get_switch_infos()
-            except Exception:  # noqa: BLE001 - the library raises many types for an expired session
-                # A stale session is the usual cause; reconnect once before failing.
-                _LOGGER.info("re-authenticating to %s", self.host)
+            except Exception:  # noqa: BLE001 - several unrelated types mean "poll failed"
+                # The library refreshes an expired cookie in place, so reaching
+                # here means the poll failed for some other reason -- a login it
+                # could not recover, an unreachable switch, a page that would
+                # not load or parse. Rebuild the session once before giving up.
+                _LOGGER.info("reconnecting to %s after a failed poll", self.host)
                 self._connector = self._connect()
                 infos = self._connector.get_switch_infos()
 
@@ -174,15 +177,27 @@ class NetgearSwitchCollector(Collector):
         raw.add_metric([switch], 1.0 if reading["raw"] is not None else 0.0)
         yield raw
 
-        response = infos.get("response_time_s")
-        if response is not None:
-            rt = GaugeMetricFamily(
-                "netgear_plus_switch_response_seconds",
-                "Switch-reported response time for the statistics request.",
+        # Upstream sets response_time_s to `_start_time - _previous_timestamp`,
+        # and resets _previous_timestamp only after a poll completes, so it is
+        # the gap between polls rather than the time the switch took to answer.
+        #
+        # The first sample of any connection is not a poll interval at all:
+        # _previous_timestamp is set in the connector's __init__, before
+        # autodetect and login, so it spans those plus the metadata and
+        # port-status fetches and the library's two 0.25s inter-request sleeps.
+        # That happens once at process start and again whenever a failed poll
+        # forces a reconnect -- but never on routine session expiry, which the
+        # library handles by refreshing the cookie on the same connector.
+        sample_interval = infos.get("response_time_s")
+        if sample_interval is not None:
+            interval = GaugeMetricFamily(
+                "netgear_plus_library_sample_interval_seconds",
+                "Seconds between the previous poll of the switch and this one, "
+                "as measured by py-netgear-plus.",
                 labels=["switch"],
             )
-            rt.add_metric([switch], float(response))
-            yield rt
+            interval.add_metric([switch], float(sample_interval))
+            yield interval
 
         info = GaugeMetricFamily(
             "netgear_plus_switch_info",
@@ -202,7 +217,7 @@ class NetgearSwitchCollector(Collector):
         )
         yield info
 
-    def _ports(self, reading: dict[str, Any], switch: str) -> Iterator[Metric]:  # noqa: C901
+    def _ports(self, reading: dict[str, Any], switch: str) -> Iterator[Metric]:
         infos = reading["infos"]
         raw = reading["raw"]
         ports = reading["ports"] or self._infer_port_count(infos)
