@@ -37,7 +37,7 @@ data:
 | `netgear_plus_up` | gauge | `switch` | 1 if the last scrape succeeded |
 | `netgear_plus_scrape_duration_seconds` | gauge | `switch` | time spent collecting |
 | `netgear_plus_raw_counters` | gauge | `switch` | 1 = unrounded parser path, 0 = rescaled fallback |
-| `netgear_plus_switch_response_seconds` | gauge | `switch` | switch-reported response time |
+| `netgear_plus_library_sample_interval_seconds` | gauge | `switch` | seconds between polls, as the library measures it — see below |
 | `netgear_plus_switch_info` | gauge | `switch`, `model`, `firmware`, `bootloader`, `serial`, `ip` | static facts, always 1 |
 | `netgear_plus_port_info` | gauge | `switch`, `port`, `description` | port metadata, always 1 |
 | `netgear_plus_port_up` | gauge | `switch`, `port` | 1 when the port has link |
@@ -49,6 +49,51 @@ data:
 The port description is a label on its **own** `netgear_plus_port_info` metric,
 not on the numeric series. Renaming a port in the switch UI would otherwise
 orphan every existing time series for that port.
+
+> **Renaming in 0.2.0.** `netgear_plus_switch_response_seconds` becomes
+> `netgear_plus_library_sample_interval_seconds`; `0.1.1` and earlier export
+> the old name. It called the value a switch-reported response time and it was
+> never either. Update any dashboard or alert referring to it — the value
+> itself is unchanged.
+
+`netgear_plus_library_sample_interval_seconds` is the gap between the library's
+**last two polls** of the switch — measured from the end of the previous poll
+to the start of this one's statistics fetch, so it runs slightly long. It is
+not how long the switch took to answer, and not an age that grows between
+scrapes: the same value is republished unchanged on every cached scrape until
+the next real poll.
+
+It is worth watching because it is the most direct view of the exporter's true
+polling rate, which is not your scrape interval. Responses are cached for
+`NETGEAR_EXPORTER_CACHE_SECONDS`, so polls are capped at one per TTL however
+many things read `/metrics` — but any additional consumer (a second scraper, a
+healthcheck that fetches `/metrics`) shifts when polls land and pushes the rate
+towards that ceiling. Expect a value at or above the cache TTL.
+
+**The first sample of a connection reads low** and is not a poll interval: it
+spans login and setup instead. That happens once at exporter start, and again
+whenever a failed poll forces a reconnect — so alert on it only in combination
+with `netgear_plus_up`, never on its own. Routine session expiry does *not*
+cause it: the library refreshes the cookie on the same connection.
+
+### Not exported: the library's `port_N_speed_rx_mbytes` and friends
+
+`py-netgear-plus` exposes `port_N_speed_rx_mbytes`, `_speed_tx_mbytes` and
+`_speed_io_mbytes` — a byte delta between its own polls, divided by the
+interval between them. They are deliberately left out:
+
+- Exporters expose counters and Prometheus computes the rates.
+  `rate(netgear_plus_port_rx_bytes_total[5m])` gives any window you ask for; a
+  pre-computed gauge is one window you cannot change or align to your scrape.
+- The divisor is the gap between *library* polls, which moves with the cache
+  TTL and with how many things read `/metrics`. The average would be taken over
+  a window that silently changes.
+- The underlying delta reports `0` — not "unknown" — whenever the previous
+  reading was 0. So the first sample of any connection looks like idle traffic,
+  as does any port whose counter was still 0 last time.
+
+Note `netgear_plus_port_speed_mbps` is unrelated: it is the negotiated link
+speed, not a throughput.
 
 ## Configuration
 
@@ -64,9 +109,10 @@ All configuration is environment variables. One container per switch.
 | `NETGEAR_EXPORTER_CACHE_SECONDS` | `30` | minimum seconds between switch scrapes |
 | `NETGEAR_EXPORTER_LOG_LEVEL` | `INFO` | Python log level |
 
-`NETGEAR_EXPORTER_CACHE_SECONDS` protects the switch: these are small devices
-that re-authenticate on every scrape cycle, and Prometheus may scrape more often
-than they enjoy. Readings are served from cache in between.
+`NETGEAR_EXPORTER_CACHE_SECONDS` protects the switch: each poll costs it two
+page renders (four on PoE models), and Prometheus may scrape more often than a
+device this small comfortably serves. Readings are served from cache in
+between.
 
 ## Running
 
