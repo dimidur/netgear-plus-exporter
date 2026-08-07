@@ -14,9 +14,10 @@ Two data paths are used deliberately:
 * **Everything else** (link state, negotiated speed, port description, firmware,
   serial) comes from ``get_switch_infos()``, where rounding is irrelevant.
 
-The parser layer is not a stable public API, so it is probed defensively and
-falls back to the megabyte values scaled back to bytes. The fallback is exposed
-as ``netgear_plus_raw_counters`` so you can tell which path produced the data.
+The parser layer is not a stable public API, so it is probed defensively; a
+fallback to the megabyte values scaled back to bytes exists, but whether it is
+used is decided once per process -- see ``NetgearSwitchCollector._effective_raw``.
+``netgear_plus_raw_counters`` reports which path produced the exported data.
 """
 
 from __future__ import annotations
@@ -81,8 +82,9 @@ class NetgearSwitchScraper:
             parsed = connector._get_port_statistics()  # noqa: SLF001
         except Exception:
             _LOGGER.warning(
-                "raw counter path unavailable for %s; falling back to rounded "
-                "megabyte values (netgear_plus_raw_counters=0)",
+                "raw counter path unavailable for %s; the collector decides "
+                "whether to fall back or fail the scrape -- see "
+                "netgear_plus_raw_counters and netgear_plus_up",
                 self.host,
                 exc_info=True,
             )
@@ -136,6 +138,15 @@ class NetgearSwitchCollector(Collector):
 
     def __init__(self, scraper: NetgearSwitchScraper) -> None:
         self.scraper = scraper
+        # None until the first successful scrape, then latched to the counter
+        # derivation chosen there -- see _effective_raw.
+        self._raw_latched: bool | None = None
+        self._upgrade_logged = False
+        # Serialises the latch check-and-set: without it, two concurrent
+        # first-ever collects straddling a cache expiry could hold readings
+        # that differ in raw availability and latch last-writer-wins --
+        # after one of them already exported the losing derivation.
+        self._latch_lock = threading.Lock()
 
     def collect(self) -> Iterator[Metric]:
         switch = self.scraper.name
@@ -146,6 +157,7 @@ class NetgearSwitchCollector(Collector):
         )
         try:
             reading = self.scraper.scrape()
+            raw = self._effective_raw(reading["raw"])
         except Exception as exc:  # noqa: BLE001 - a dead switch must not 500 the endpoint
             _LOGGER.warning("scrape of %s failed: %s", self.scraper.host, exc)
             up.add_metric([switch], 0.0)
@@ -154,10 +166,56 @@ class NetgearSwitchCollector(Collector):
 
         up.add_metric([switch], 1.0)
         yield up
-        yield from self._describe(reading, switch)
-        yield from self._ports(reading, switch)
+        yield from self._describe(reading, switch, raw)
+        yield from self._ports(reading, switch, raw)
 
-    def _describe(self, reading: dict[str, Any], switch: str) -> Iterator[Metric]:
+    def _effective_raw(self, raw: dict[str, list[int]] | None) -> dict[str, list[int]] | None:
+        """Latch the counter derivation chosen on the first successful scrape.
+
+        Raw and fallback derive the same counter series two different ways,
+        and the two disagree by up to 5 kB -- half the fallback's 10 kB
+        rounding quantum. Switching mid-series can move a counter DOWN, which
+        Prometheus reads as a counter reset: increase() then credits the whole
+        counter value as new traffic, and that corruption sits in the TSDB
+        long after the flip. So the path is chosen once:
+
+        - raw latched, raw lost: the scrape fails (netgear_plus_up 0) rather
+          than emitting differently-derived values into the same series.
+        - fallback latched, raw appears: fallback continues -- the byte series
+          keep their derivation and stay monotone -- and a restart upgrades.
+
+        A failed scrape latches nothing, so a switch that is briefly
+        unreachable at startup still gets the raw path once it answers.
+        The check-and-set is serialised by a lock: concurrent collects
+        usually share one cached reading, but two first-ever collects
+        straddling a cache expiry can hold readings that differ in raw
+        availability, and unserialised they would latch last-writer-wins
+        after one had already exported the losing derivation.
+        """
+        with self._latch_lock:
+            if self._raw_latched is None:
+                self._raw_latched = raw is not None
+                return raw
+            if self._raw_latched and raw is None:
+                msg = (
+                    "raw counter path lost mid-run; failing the scrape "
+                    "rather than switching the series to "
+                    "differently-derived values"
+                )
+                raise SwitchScrapeError(msg)
+            if not self._raw_latched and raw is not None:
+                if not self._upgrade_logged:
+                    self._upgrade_logged = True
+                    _LOGGER.info(
+                        "raw counter path became available for %s; restart the exporter to use it",
+                        self.scraper.host,
+                    )
+                return None
+            return raw
+
+    def _describe(
+        self, reading: dict[str, Any], switch: str, raw: dict[str, list[int]] | None
+    ) -> Iterator[Metric]:
         infos = reading["infos"]
 
         duration = GaugeMetricFamily(
@@ -168,14 +226,16 @@ class NetgearSwitchCollector(Collector):
         duration.add_metric([switch], reading["duration"])
         yield duration
 
-        raw = GaugeMetricFamily(
+        # Reports the path the exported counters actually use -- the latched
+        # one -- not whatever this reading happened to carry.
+        raw_family = GaugeMetricFamily(
             "netgear_plus_raw_counters",
             "1 when byte counters come from the unrounded parser path, "
             "0 when they were reconstructed from rounded megabyte values.",
             labels=["switch"],
         )
-        raw.add_metric([switch], 1.0 if reading["raw"] is not None else 0.0)
-        yield raw
+        raw_family.add_metric([switch], 1.0 if raw is not None else 0.0)
+        yield raw_family
 
         # Upstream sets response_time_s to `_start_time - _previous_timestamp`,
         # and resets _previous_timestamp only after a poll completes, so it is
@@ -217,9 +277,10 @@ class NetgearSwitchCollector(Collector):
         )
         yield info
 
-    def _ports(self, reading: dict[str, Any], switch: str) -> Iterator[Metric]:
+    def _ports(
+        self, reading: dict[str, Any], switch: str, raw: dict[str, list[int]] | None
+    ) -> Iterator[Metric]:
         infos = reading["infos"]
-        raw = reading["raw"]
         ports = reading["ports"] or self._infer_port_count(infos)
 
         # The port description is a LABEL on its own info metric rather than on

@@ -50,6 +50,16 @@ The port description is a label on its **own** `netgear_plus_port_info` metric,
 not on the numeric series. Renaming a port in the switch UI would otherwise
 orphan every existing time series for that port.
 
+**The counter path is latched at the first successful scrape.** Raw and
+fallback derive the same series two ways that disagree by up to 5 kB — half
+the fallback's 10 kB rounding quantum — so switching mid-run can move a
+counter *down*. Prometheus reads that as a counter reset, and `increase()`
+credits the whole counter value as new traffic. If the raw path is lost mid-run
+the exporter reports `netgear_plus_up 0` rather than switching; if the raw path
+appears while the fallback is latched, it is picked up at the next restart.
+`netgear_plus_raw_counters` reports the path the exported counters actually
+use.
+
 > **Renaming in 0.2.0.** `netgear_plus_switch_response_seconds` becomes
 > `netgear_plus_library_sample_interval_seconds`; `0.1.1` and earlier export
 > the old name. It called the value a switch-reported response time and it was
