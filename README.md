@@ -91,6 +91,10 @@ interval between them. They are deliberately left out:
 - The underlying delta reports `0` — not "unknown" — whenever the previous
   reading was 0. So the first sample of any connection looks like idle traffic,
   as does any port whose counter was still 0 last time.
+- They exist only in the `_mbytes` form, through the same
+  `round(v * 1e-6, 2)` that reason 1 at the top of this README rejects for
+  counters. Exporting them would reintroduce the 10 kB quantisation this
+  project exists to avoid.
 
 Note `netgear_plus_port_speed_mbps` is unrelated: it is the negotiated link
 speed, not a throughput.
