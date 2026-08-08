@@ -7,7 +7,14 @@ rounding fallback, port-count inference -- are pinned down.
 
 from __future__ import annotations
 
-from netgear_plus_exporter.exporter import NetgearSwitchCollector
+import pytest
+
+from netgear_plus_exporter.exporter import (
+    NetgearSwitchCollector,
+    NetgearSwitchScraper,
+    SwitchScrapeError,
+    _bytes_went_all_zero,
+)
 
 PORTS = 5
 
@@ -74,6 +81,11 @@ RAW = {
     "sum_tx": [1_442_101, 0, 0, 3_400_000, 3_500_000],
     "crc_errors": [0, 0, 0, 7, 0],
 }
+
+
+def _zeros():
+    """Fresh lists every call: a shared constant would alias mutations."""
+    return {key: [0] * PORTS for key in ("sum_rx", "sum_tx", "crc_errors")}
 
 
 def _collector(*readings):
@@ -318,3 +330,143 @@ def test_upstream_private_entry_point_still_exists():
 
     # Act + Assert
     assert hasattr(py_netgear_plus.NetgearSwitchConnector, "_get_port_statistics")
+
+
+class _StubConnector:
+    """The two attributes _raw_port_statistics reads, with no network."""
+
+    def __init__(self, parsed, ports=PORTS):
+        self._parsed = parsed
+        self.ports = ports
+
+    def _get_port_statistics(self):
+        return self._parsed
+
+
+def _scraper():
+    # No I/O happens in __init__; the connection is only built inside scrape().
+    return NetgearSwitchScraper("192.0.2.1", "unused")
+
+
+def test_statistics_with_extra_rows_are_not_trusted():
+    """The parser pads SHORT lists to the port count, so a length mismatch
+    can only mean extra rows -- a header parsed as data, a model variant.
+    Positionally shifted counters attributed to the wrong ports are worse
+    than the rounded fallback.
+    """
+    # Arrange
+    parsed = {
+        "sum_rx": [1, 2, 3, 4, 5, 6],  # six rows for a five-port switch
+        "sum_tx": [1, 2, 3, 4, 5, 6],
+        "crc_errors": [0, 0, 0, 0, 0, 0],
+    }
+
+    # Act
+    raw = _scraper()._raw_port_statistics(_StubConnector(parsed), None)
+
+    # Assert
+    assert raw is None
+
+
+def test_correct_length_statistics_pass_the_guard():
+    # Arrange
+    parsed = dict(RAW)
+
+    # Act
+    raw = _scraper()._raw_port_statistics(_StubConnector(parsed), None)
+
+    # Assert
+    assert raw == RAW
+
+
+def test_length_guard_is_skipped_when_the_port_count_is_unknown():
+    """ports=0 means the connector never learned the count; rejecting on a
+    comparison against 0 would reject every reading.
+    """
+    # Arrange
+    parsed = dict(RAW)
+
+    # Act
+    raw = _scraper()._raw_port_statistics(_StubConnector(parsed, ports=0), None)
+
+    # Assert
+    assert raw == RAW
+
+
+def test_all_zero_bytes_after_traffic_fail_the_scrape():
+    """A truncated statistics page arrives type-correct, length-correct and
+    zero-padded -- indistinguishable from a healthy idle switch except for
+    history. Counters do not all reset while traffic was flowing, so the
+    scrape fails loudly instead of exporting flat zeros with up=1.
+    """
+    # Arrange
+    connector = _StubConnector(_zeros())
+
+    # Act + Assert
+    with pytest.raises(SwitchScrapeError, match="parse break"):
+        _scraper()._raw_port_statistics(connector, RAW)
+
+
+def test_all_zero_bytes_with_no_history_are_a_valid_reading():
+    # Arrange -- a brand-new idle switch really does read all zeros.
+    zeros = _zeros()
+
+    # Act
+    raw = _scraper()._raw_port_statistics(_StubConnector(zeros), None)
+
+    # Assert
+    assert raw == zeros
+
+
+def test_zero_transition_ignores_crc_history():
+    """CRC-only history must not arm the trap: all-zero CRC is the healthy
+    steady state, so it proves nothing about whether bytes were flowing.
+    """
+    # Arrange
+    crc_only_history = dict(_zeros(), crc_errors=[3, 0, 0, 0, 0])
+    crc_only_now = dict(_zeros(), crc_errors=[9, 0, 0, 0, 0])
+
+    # Act + Assert -- CRC on the history side proves nothing...
+    assert _bytes_went_all_zero(crc_only_history, _zeros()) is False
+    assert _bytes_went_all_zero(RAW, _zeros()) is True
+    assert _bytes_went_all_zero(_zeros(), _zeros()) is False
+    assert _bytes_went_all_zero(None, _zeros()) is False
+    # ...and CRC on the current side buys no amnesty: a partially truncated
+    # page can keep a nonzero CRC cell while every byte counter zeroes out,
+    # which is exactly the parse break this exists to catch.
+    assert _bytes_went_all_zero(RAW, crc_only_now) is True
+
+
+class _StubPollingConnector:
+    """Enough connector for scrape() to run without any network."""
+
+    ports = PORTS
+    switch_model = None
+
+    def __init__(self, stats_sequence):
+        self._stats = stats_sequence
+
+    def get_switch_infos(self):
+        return {"switch_ip": "192.0.2.1"}
+
+    def _get_port_statistics(self):
+        return self._stats.pop(0) if len(self._stats) > 1 else self._stats[0]
+
+
+def test_scrape_wires_cached_history_and_preserves_it_on_failure():
+    """The zero-transition guard only works if scrape() hands it the cached
+    previous reading AND a failed scrape leaves that cache untouched. Moving
+    the cache write above the guard would silently break recovery: the zeroed
+    reading would become the new history and the next zeros would pass.
+    """
+    # Arrange -- connection pre-seeded, so no network is involved.
+    scraper = NetgearSwitchScraper("192.0.2.1", "unused", cache_seconds=0.0)
+    scraper._connector = _StubPollingConnector([dict(RAW), _zeros(), _zeros()])
+
+    # Act + Assert -- traffic, then zeros, then zeros again.
+    assert scraper.scrape()["raw"] == RAW
+    with pytest.raises(SwitchScrapeError, match="parse break"):
+        scraper.scrape()
+    # History survived the failed scrape: still compared against RAW.
+    with pytest.raises(SwitchScrapeError, match="parse break"):
+        scraper.scrape()
