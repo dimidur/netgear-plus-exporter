@@ -38,6 +38,23 @@ _LOGGER = logging.getLogger(__name__)
 BYTES_PER_MEGABYTE = 1_000_000  # py_netgear_plus uses decimal MB (1e-6)
 
 
+def _bytes_went_all_zero(
+    previous: dict[str, list[int]] | None, current: dict[str, list[int]]
+) -> bool:
+    """True when every rx/tx byte counter is zero but the previous reading
+    had traffic somewhere.
+
+    CRC counters are excluded on both sides: all-zero CRC is the healthy
+    steady state, so it can neither establish "there was data before" nor
+    count against the current reading.
+    """
+    if previous is None:
+        return False
+    had_traffic = any(any(previous.get(key) or []) for key in ("sum_rx", "sum_tx"))
+    all_zero_now = not any(any(current.get(key) or []) for key in ("sum_rx", "sum_tx"))
+    return had_traffic and all_zero_now
+
+
 class SwitchScrapeError(Exception):
     """Raised when a scrape cycle fails."""
 
@@ -69,12 +86,30 @@ class NetgearSwitchScraper:
             raise SwitchScrapeError(msg)
         return connector
 
-    def _raw_port_statistics(self, connector: Any) -> dict[str, list[int]] | None:
+    def _raw_port_statistics(
+        self, connector: Any, previous_raw: dict[str, list[int]] | None
+    ) -> dict[str, list[int]] | None:
         """Return unrounded per-port counters, or None if unavailable.
 
         Reaches into the library's fetch/parse layer on purpose -- see module
-        docstring. Any structural change upstream lands here as None and the
-        caller degrades to the rounded values instead of crashing.
+        docstring. A structural change upstream lands here as None and the
+        collector decides what that means.
+
+        Two integrity checks guard against a parse break that still produces
+        well-typed output. The parser pads short lists with zeros to exactly
+        the port count, so a truncated statistics page arrives type-correct,
+        length-correct and zeroed -- with every health signal green:
+
+        - A list whose length disagrees with the port count (padding only
+          extends, so this means EXTRA rows -- a header parsed as data, a
+          model variant) is not trusted: None, and the collector decides.
+        - Byte counters all reading zero right after a reading that was not
+          zero is a parse break until proven otherwise, and raises. A
+          reboot or a manual counter clear produces the same transition
+          legitimately; those fail scrapes until rx/tx bytes move again --
+          seconds on a switch passing traffic, and CRC movement alone does
+          not count -- where trusting a broken parse costs silently flat
+          traffic with ``netgear_plus_up`` still 1.
         """
         try:
             # Single upstream entry point: it picks the HTML or JSON-API path per
@@ -94,7 +129,30 @@ class NetgearSwitchScraper:
         wanted = ("sum_rx", "sum_tx", "crc_errors")
         if not all(isinstance(parsed.get(key), list) for key in wanted):
             return None
-        return {key: [int(value or 0) for value in parsed[key]] for key in wanted}
+        ports = int(getattr(connector, "ports", 0) or 0)
+        if ports and any(len(parsed[key]) != ports for key in wanted):
+            mismatched_key = next(key for key in wanted if len(parsed[key]) != ports)
+            _LOGGER.warning(
+                "statistics row count disagrees with the port count for %s: "
+                "%s has %d rows for %d ports; not trusting the raw path",
+                self.host,
+                mismatched_key,
+                len(parsed[mismatched_key]),
+                ports,
+            )
+            return None
+        raw = {key: [int(value or 0) for value in parsed[key]] for key in wanted}
+        if _bytes_went_all_zero(previous_raw, raw):
+            msg = (
+                f"all byte counters read zero on {self.host} right after a "
+                "non-zero reading; a truncated statistics page is padded with "
+                "zeros and looks exactly like this, so the scrape fails "
+                "rather than exporting counters that may be a parse break "
+                "(a real reboot or counter clear recovers automatically "
+                "once rx/tx bytes move again)"
+            )
+            raise SwitchScrapeError(msg)
+        return raw
 
     def scrape(self) -> dict[str, Any]:
         """Return a reading, reusing the cache while it is fresh."""
@@ -123,7 +181,10 @@ class NetgearSwitchScraper:
 
             reading = {
                 "infos": infos,
-                "raw": self._raw_port_statistics(self._connector),
+                "raw": self._raw_port_statistics(
+                    self._connector,
+                    (self._cached or {}).get("raw"),
+                ),
                 "ports": int(getattr(self._connector, "ports", 0) or 0),
                 "model": getattr(getattr(self._connector, "switch_model", None), "MODEL_NAME", ""),
                 "duration": time.monotonic() - started,
