@@ -1,3 +1,4 @@
+---
 name: base-refresh
 
 # Rebuild and republish when the BASE IMAGE moves, not when this code changes.
@@ -20,7 +21,7 @@ name: base-refresh
 
 on:
   schedule:
-    - cron: "0 4 * * 1" # Mondays, 04:00 UTC
+    - cron: "0 4 * * 1"  # Mondays, 04:00 UTC
   workflow_dispatch:
     inputs:
       ignore_grace:
@@ -34,12 +35,14 @@ env:
 
 jobs:
   refresh:
+    name: Open a version-bump pull request when the base image has moved
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v7
+      - name: Check out the repository
+        uses: actions/checkout@v7
 
       # Hashing the raw manifest index rather than using --format: the template
       # is silently ignored by older buildx builds, which then print the whole
@@ -48,7 +51,8 @@ jobs:
       - name: Resolve the current base image digest
         id: base
         run: |
-          digest="sha256:$(docker buildx imagetools inspect "$BASE_IMAGE" --raw \
+          digest="sha256:$(docker buildx imagetools inspect \
+                            "$BASE_IMAGE" --raw \
                             | sha256sum | cut -d' ' -f1)"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "current base digest: $digest"
@@ -60,7 +64,7 @@ jobs:
           echo "previously built from: $previous"
           if [ "$previous" = "${{ steps.base.outputs.digest }}" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Base image unchanged — nothing to do."
+            echo "Base image unchanged, nothing to do."
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
@@ -75,10 +79,12 @@ jobs:
           repo="${BASE_IMAGE%%:*}"
           updated=$(curl -fsSL \
             "https://hub.docker.com/v2/repositories/library/$repo/tags/$tag" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["last_updated"])')
+            | python3 -c \
+              'import json, sys; print(json.load(sys.stdin)["last_updated"])')
           age_days=$(python3 - "$updated" <<'PY'
           import sys, datetime
-          then = datetime.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+          raw = sys.argv[1].replace("Z", "+00:00")
+          then = datetime.datetime.fromisoformat(raw)
           now = datetime.datetime.now(datetime.timezone.utc)
           print((now - then).days)
           PY
@@ -87,13 +93,15 @@ jobs:
           if [ "${{ inputs.ignore_grace }}" = "true" ]; then
             echo "grace period overridden by manual dispatch"
           elif [ "$age_days" -lt "$GRACE_DAYS" ]; then
-            echo "only $age_days days old, grace period is $GRACE_DAYS — deferring."
+            echo "only $age_days days old, grace period is" \
+                 "$GRACE_DAYS, deferring."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "proceed=true" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/login-action@v4
+      - name: Log in to Docker Hub, so the CVE scan can pull the base image
+        uses: docker/login-action@v4
         if: steps.grace.outputs.proceed == 'true'
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -124,7 +132,8 @@ jobs:
           )
           echo "version $current -> $next"
           sed -i "0,/^version = \".*\"/s//version = \"$next\"/" pyproject.toml
-          sed -i "s/^__version__ = \".*\"/__version__ = \"$next\"/" netgear_plus_exporter/__init__.py
+          sed -i "s/^__version__ = \".*\"/__version__ = \"$next\"/" \
+            netgear_plus_exporter/__init__.py
           echo "${{ steps.base.outputs.digest }}" > .base-image-digest
           echo "version=$next" >> "$GITHUB_OUTPUT"
 
@@ -135,9 +144,11 @@ jobs:
         run: |
           branch="base-refresh/${{ steps.bump.outputs.version }}"
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git add pyproject.toml netgear_plus_exporter/__init__.py .base-image-digest
+          git add pyproject.toml .base-image-digest \
+            netgear_plus_exporter/__init__.py
           git commit -m "build: rebuild on refreshed ${BASE_IMAGE}" \
                      -m "Base digest ${{ steps.base.outputs.digest }} is newer than the one the last release was built from, is past the ${GRACE_DAYS}-day grace period, and reports no critical or high CVEs."
           git push origin "$branch"

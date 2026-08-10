@@ -1,3 +1,4 @@
+---
 name: ci
 
 on:
@@ -19,45 +20,83 @@ permissions:
 
 jobs:
   test:
+    name: Lint, type-check and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Python
+        uses: actions/setup-python@v7
         with:
           # Single version on purpose: this is distributed as a container
           # built on python:3.13-alpine and is not published to PyPI, so a
           # 3.11/3.12 matrix tested a configuration nobody runs.
           python-version: "3.13"
-      - run: python -m pip install --upgrade pip
-      - run: pip install -e '.[dev]'
 
-      - name: lint
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install the package and its dev dependencies
+        run: pip install -e '.[dev]'
+
+      - name: Lint Python for errors and style (ruff)
         run: ruff check .
 
       # `ruff check` does not enforce formatting; without this, unformatted
       # code reaches main (it did).
-      - name: format
+      - name: Check Python formatting (ruff format)
         run: ruff format --check --diff .
 
-      - name: types
+      - name: Type-check the exporter package (mypy)
         run: mypy netgear_plus_exporter
 
-      - name: test
+      - name: Check YAML formatting (yamllint)
+        run: yamllint .
+
+      # yamllint checks formatting only, and cannot tell GitHub's `on:` key
+      # from a boolean. actionlint understands workflow semantics -- a `uses:`
+      # that does not resolve, an expression that cannot evaluate -- and runs
+      # shellcheck over every `run:` body.
+      #
+      # This wrapper action rather than `docker://rhysd/actionlint:ver`:
+      # dependabot-core's github-actions parser skips any ref beginning
+      # `docker://`, so that form is a pin nothing bumps. Dependabot tracks
+      # the wrapper only; `version:` below is an input, not a `uses:` ref, so
+      # the actionlint release itself is reviewed by hand.
+      - name: Check workflow syntax and embedded shell (actionlint)
+        uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7  # v2.2.0
+        with:
+          version: 1.7.12
+
+      # The action rather than `npx markdownlint-cli2@ver`: Dependabot reads
+      # `uses:` refs and does not parse a `run:` body, so the npx form is a pin
+      # nothing bumps. It also carries its own Node runtime.
+      - name: Lint Markdown prose (markdownlint)
+        uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff  # v24.2.0
+
+      - name: Run the test suite (pytest)
         run: pytest -q
 
   security:
+    name: Audit dependencies and scan for insecure code
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Python
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
-      - run: python -m pip install --upgrade pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
 
       # The declared dependency set, taken from pyproject so the pins live in
       # exactly one place. The project itself is deliberately NOT installed
       # here -- see the pip-audit step.
-      - name: collect declared requirements
+      - name: Collect the declared requirements from pyproject.toml
         run: |
           python - <<'PY' > requirements-audit.txt
           import tomllib
@@ -68,9 +107,10 @@ jobs:
               print(req)
           PY
           cat requirements-audit.txt
-      - run: pip install -r requirements-audit.txt
+      - name: Install those requirements
+        run: pip install -r requirements-audit.txt
 
-      - name: bandit
+      - name: Scan the source for insecure patterns (bandit)
         run: bandit -q -r netgear_plus_exporter
 
       # --strict fails the audit if ANY dependency cannot be collected, which
@@ -78,31 +118,36 @@ jobs:
       # reported one. Auditing this environment instead would always trip it
       # on the project's own editable install -- not on PyPI, uncollectable --
       # so the declared requirements are audited directly.
-      - name: pip-audit
+      - name: Audit dependencies for known advisories (pip-audit)
         run: pip-audit --progress-spinner off --strict -r requirements-audit.txt
 
   docker:
+    name: Build, smoke-test and scan the container image
     runs-on: ubuntu-latest
     # Both gates, not just test: building and scanning an image whose
     # dependencies just failed an audit wastes minutes and publishes a
     # green-looking docker job next to a red security one.
     needs: [test, security]
     steps:
-      - uses: actions/checkout@v7
-      - run: docker build -t netgear-plus-exporter:ci .
+      - name: Check out the repository
+        uses: actions/checkout@v7
 
-      - name: Container starts and rejects missing config
+      - name: Build the image
+        run: docker build -t netgear-plus-exporter:ci .
+
+      - name: Check the container starts and rejects missing configuration
         run: |
           set +e
           out=$(docker run --rm netgear-plus-exporter:ci 2>&1)
           code=$?
           set -e
           echo "$out"
-          test $code -eq 2 || { echo "expected exit 2 without NETGEAR_EXPORTER_HOST"; exit 1; }
+          test $code -eq 2 \
+            || { echo "expected exit 2 without NETGEAR_EXPORTER_HOST"; exit 1; }
 
       # Trivy rather than Docker Scout: it needs no registry credentials, so
       # this gate also runs on pull requests from forks.
-      - name: scan image
+      - name: Scan the image for critical and high CVEs (Trivy)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: netgear-plus-exporter:ci

@@ -1,0 +1,31 @@
+---
+# yamllint defaults, with two departures.
+extends: default
+
+# Without this a local `yamllint .` reports on trees a clean checkout does not
+# have, so local and CI disagree. Listed by hand rather than read from
+# .gitignore: yamllint rejects a config carrying both keys.
+ignore: |
+  .venv/
+  node_modules/
+
+rules:
+  # GitHub spells the trigger block `on:`, which YAML 1.1 reads as a boolean.
+  # yamllint cannot tell that key from a truthy value; workflow semantics are
+  # gated by the actionlint step in ci.yml instead.
+  truthy:
+    check-keys: false
+
+  # A warning, not an error.
+  #
+  # Every command that can be split across two lines already is. What is left
+  # over 80 columns is message text a human reads: a commit body, a pull
+  # request title, a pull request body. Breaking one of those lines changes
+  # the message itself.
+  #
+  # The exceptions are the SHA-pinned `uses:` refs in ci.yml. A commit SHA
+  # cannot be split, and the trailing version comment is where Dependabot
+  # writes.
+  line-length:
+    max: 80
+    level: warning
