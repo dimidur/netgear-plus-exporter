@@ -1,8 +1,11 @@
+---
 name: release
 
 on:
   push:
     tags: ["v*"]
+  # From a branch this runs `verify` alone -- both later jobs are gated on a
+  # tag ref. Dispatching from a tag ref performs the whole release.
   workflow_dispatch:
 
 jobs:
@@ -10,36 +13,53 @@ jobs:
   # tagging a broken commit, or tagging while main was red, shipped it. The
   # full gate suite now runs against the tagged tree first.
   verify:
+    name: Run the full CI gate suite against the tagged tree
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
 
   publish:
+    name: Build and push the images to Docker Hub
     needs: verify
+    # Tag refs only -- on a dispatch from a branch the semver patterns match
+    # nothing, and the image would be pushed as `latest` alone, claiming no
+    # version identity.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - name: Check out the tagged tree
+        uses: actions/checkout@v7
 
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
+      - name: Set up QEMU, so the arm64 image can be built on an amd64 runner
+        uses: docker/setup-qemu-action@v4
 
-      - uses: docker/login-action@v4
+      - name: Set up Buildx, the multi-architecture builder
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - id: meta
+      - name: Derive the image tags and labels from the git tag
+        id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/netgear-plus-exporter
+          # `latest` is not a tag entry: under auto it is attached to a semver
+          # tag push and withheld from a prerelease. Stated rather than left
+          # to the default, so a major bump of the action cannot change it
+          # silently.
+          flavor: latest=auto
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
 
-      - uses: docker/build-push-action@v7
+      - name: Build and push the amd64 and arm64 images
+        uses: docker/build-push-action@v7
         with:
           context: .
           # arm64 included so the exporter can run on a Pi next to the switch it
@@ -50,3 +70,39 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Notes come from GitHub's own generator, categorised by the PR labels listed
+  # in .github/release.yml. Runs after publish so the release is only announced
+  # once its images are on Docker Hub.
+  notes:
+    name: Publish the GitHub release with generated notes
+    needs: publish
+    # Tag refs only -- a dispatch from a branch has no tag to release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            # `gh release edit` has no --generate-notes, so a re-run cannot
+            # rebuild a body -- and rewriting the title would discard one
+            # edited by hand. Leave the release as it is.
+            echo "release $TAG already exists; leaving it untouched"
+            exit 0
+          fi
+
+          # A tag carrying a suffix (v1.2.0-rc1) must not take the Latest badge.
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+
+          # --verify-tag: without it, a create for a missing tag silently
+          # invents one from the default branch.
+          # No --title: --generate-notes supplies one.
+          gh release create "$TAG" --repo "$REPO" \
+            --generate-notes --verify-tag $prerelease

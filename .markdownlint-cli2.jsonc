@@ -1,0 +1,26 @@
+// Prose is hard-wrapped at 80 columns. All rules on by default.
+{
+  "config": {
+    "MD013": {
+      "line_length": 80,
+      // A table row is one line by definition, and code cannot be rewrapped
+      // without breaking it. Long URLs need no exemption -- MD013 already
+      // ignores a line with no space past the limit.
+      "tables": false,
+      "code_blocks": false
+    },
+    // Headings, bullets and code fences. All three default to "consistent",
+    // which is scoped to a single document -- one file may open with `*`
+    // bullets and another with `-`, and both pass. Naming the style is what
+    // makes them uniform across the set.
+    "MD003": { "style": "atx" },
+    "MD004": { "style": "dash" },
+    "MD048": { "style": "backtick" }
+  },
+  "globs": ["**/*.md"],
+  // Without this a local run also lints caches a clean checkout does not have
+  // (.pytest_cache/README.md), so local and CI disagree.
+  "gitignore": true,
+  // node_modules is the one tree not covered above -- it is not gitignored.
+  "ignores": ["node_modules/**"]
+}

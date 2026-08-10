@@ -1,11 +1,12 @@
+---
 # Dependencies are pinned exactly (== in pyproject.toml) so builds are
-# reproducible — which also means they never move on their own. Dependabot is
+# reproducible, which also means they never move on their own. Dependabot is
 # what makes a pinned dependency a decision rather than neglect.
 #
 # py-netgear-plus matters most: it owns the login handshake and the per-model
 # HTML parsing, so a firmware change upstream is fixed there, not here.
 #
-# The BASE image is deliberately not covered — base-refresh.yml handles it with
+# The BASE image is deliberately not covered. base-refresh.yml handles it with
 # a grace period and a CVE gate that Dependabot cannot express.
 version: 2
 updates:
