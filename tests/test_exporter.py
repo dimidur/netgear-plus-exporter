@@ -33,6 +33,9 @@ def _infos(**overrides):
         infos[f"port_{port}_description"] = ""
         infos[f"port_{port}_sum_rx_mbytes"] = 3.63
         infos[f"port_{port}_sum_tx_mbytes"] = 1.44
+    # What upstream really emits: the last port only, plus the switch-wide sum.
+    infos[f"port_{PORTS}_crc_errors"] = 3
+    infos["sum_port_crc_errors"] = 3
     infos.update(overrides)
     return infos
 
@@ -83,6 +86,12 @@ RAW = {
 }
 
 
+def _raw():
+    """Fresh lists every call: a shared constant would alias mutations, and an
+    assertion comparing a mutated input against RAW could not fail."""
+    return {key: list(values) for key, values in RAW.items()}
+
+
 def _zeros():
     """Fresh lists every call: a shared constant would alias mutations."""
     return {key: [0] * PORTS for key in ("sum_rx", "sum_tx", "crc_errors")}
@@ -106,8 +115,10 @@ def test_raw_parser_values_win_over_rounded_megabytes():
     # CRC is present for every port, including ports the public dict omits.
     assert _sample(families["netgear_plus_port_crc_errors"], 4) == 7
     assert _sample(families["netgear_plus_port_crc_errors"], 1) == 0
-    # Switch-scoped, not per-port: _sample() matches on a "port" label, so the
-    # previous form here compared against the string "None" and could not fail.
+    # Port 5 discriminates the two sources: the parser says 0, the public
+    # dict's delta says 3. The raw path must report the parser.
+    assert _sample(families["netgear_plus_port_crc_errors"], 5) == 0
+    # Switch-scoped, not per-port; _sample() matches on a "port" label.
     assert "port" not in families["netgear_plus_raw_counters"].samples[0].labels
     assert families["netgear_plus_raw_counters"].samples[0].value == 1.0
 
@@ -126,10 +137,8 @@ def test_sample_interval_is_named_and_described_for_what_it_measures():
     assert "netgear_plus_switch_response_seconds" not in families
     interval = families["netgear_plus_library_sample_interval_seconds"]
     assert interval.samples[0].value == 1.5
-    # Pinned whole rather than by keyword: substring checks measure vocabulary,
-    # not meaning. "Seconds the switch took to answer the poll, as measured by
-    # py-netgear-plus" satisfies any plausible set of keyword assertions while
-    # restating exactly the claim this metric was renamed to stop making.
+    # Pinned whole: a keyword check passes for a reworded version of the same
+    # false claim.
     assert interval.documentation == (
         "Seconds between the previous poll of the switch and this one, "
         "as measured by py-netgear-plus."
@@ -173,8 +182,29 @@ def test_falls_back_to_rescaled_megabytes_when_parser_unavailable():
     # Assert
     assert _sample(families["netgear_plus_port_rx_bytes"], 1) == 3_630_000
     assert families["netgear_plus_raw_counters"].samples[0].value == 0.0
-    # No CRC is available on the fallback path; better absent than fabricated.
+    # The fixture carries port_5_crc_errors, so this fails if it is exported.
     assert families["netgear_plus_port_crc_errors"].samples == []
+
+
+def test_fallback_never_exports_the_per_interval_crc_delta():
+    """The key is a delta, so it stays out even if upstream ever fixes the
+    one-port-only bug and populates every port.
+    """
+    # Arrange
+    infos = _infos()
+    for port in range(1, PORTS + 1):
+        infos[f"port_{port}_crc_errors"] = 999
+    infos["sum_port_crc_errors"] = 999 * PORTS
+
+    # Act
+    families = _collect(_reading(infos=infos))
+
+    # Assert
+    crc = families["netgear_plus_port_crc_errors"]
+    assert crc.samples == []
+    # The empty family is all a /metrics reader sees, so the HELP has to say
+    # the absence is deliberate.
+    assert "Absent when netgear_plus_raw_counters is 0." in crc.documentation
 
 
 def test_link_state_and_speed_are_reported_per_port():
@@ -207,12 +237,8 @@ def test_description_is_a_label_on_its_own_info_metric():
 
 
 def test_losing_the_raw_path_fails_the_scrape_instead_of_switching():
-    """The two counter paths disagree by up to 5 kB -- half the fallback's
-    rounding quantum -- so flipping between them mid-series can move a counter
-    DOWN.
-    Prometheus reads that as a counter reset and increase() credits the whole
-    counter as new traffic -- corruption that outlives the flip. Losing the
-    raw path must therefore fail the scrape, not switch derivations.
+    """Losing the raw path fails the scrape rather than switching derivations
+    -- see the latch note in README.md for why a switch corrupts the series.
     """
     # Arrange
     collector = _collector(
@@ -239,10 +265,8 @@ def test_losing_the_raw_path_fails_the_scrape_instead_of_switching():
 
 
 def test_fallback_stays_latched_when_raw_appears():
-    """The upgrade direction is deferred to a restart rather than taken live:
-    the byte series keep their derivation and stay monotone, because jumping
-    to raw mid-series is the same up-to-5kB discontinuity as the other
-    direction, just mirrored.
+    """The upgrade direction is deferred to a restart: jumping to raw
+    mid-series is the same discontinuity as the other direction, mirrored.
     """
     # Arrange
     collector = _collector(_reading(), _reading(raw=RAW))
@@ -320,10 +344,10 @@ def test_upstream_private_entry_point_still_exists():
 
     Unrounded counters and per-port CRC both come from
     NetgearSwitchConnector._get_port_statistics(). If a py-netgear-plus release
-    renames or removes it, the exporter silently degrades to rounded megabyte
-    values and partial CRC -- which is exactly the failure this project exists
-    to avoid, and it is invisible without a switch to test against. This catches
-    the rename in CI, with no hardware.
+    renames or removes it, the exporter degrades to rounded megabyte values and
+    no CRC at all -- which is exactly the failure this project exists to avoid,
+    and it is invisible without a switch to test against. This catches the
+    rename in CI, with no hardware.
     """
     # Arrange
     import py_netgear_plus
@@ -370,7 +394,7 @@ def test_statistics_with_extra_rows_are_not_trusted():
 
 def test_correct_length_statistics_pass_the_guard():
     # Arrange
-    parsed = dict(RAW)
+    parsed = _raw()
 
     # Act
     raw = _scraper()._raw_port_statistics(_StubConnector(parsed), None)
@@ -384,7 +408,7 @@ def test_length_guard_is_skipped_when_the_port_count_is_unknown():
     comparison against 0 would reject every reading.
     """
     # Arrange
-    parsed = dict(RAW)
+    parsed = _raw()
 
     # Act
     raw = _scraper()._raw_port_statistics(_StubConnector(parsed, ports=0), None)
@@ -461,7 +485,7 @@ def test_scrape_wires_cached_history_and_preserves_it_on_failure():
     """
     # Arrange -- connection pre-seeded, so no network is involved.
     scraper = NetgearSwitchScraper("192.0.2.1", "unused", cache_seconds=0.0)
-    scraper._connector = _StubPollingConnector([dict(RAW), _zeros(), _zeros()])
+    scraper._connector = _StubPollingConnector([_raw(), _zeros(), _zeros()])
 
     # Act + Assert -- traffic, then zeros, then zeros again.
     assert scraper.scrape()["raw"] == RAW

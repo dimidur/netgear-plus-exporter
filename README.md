@@ -28,10 +28,12 @@ data:
    it, which returns the raw integers the switch actually reported, and falls
    back to the rounded values only if that path is unavailable, reporting which
    one it used as `netgear_plus_raw_counters`.
-2. **CRC errors on every port.** The library's public dict drops most of them on
-   the way out; the parser returns one value per port. CRC is the single most
-   useful metric these switches expose: a rising count means a bad cable,
-   connector or port, and it is not derivable from anything else.
+2. **CRC errors on every port.** The library's public dict drops all but one on
+   the way out, and that one is a delta; the parser returns a cumulative value
+   per port. CRC is the single most useful metric these switches expose: a
+   rising count means a bad cable, connector or port, and it is not derivable
+   from anything else. This needs the parser path: on the fallback there is no
+   usable CRC at all, see below.
 3. **Port descriptions.** The label you set on a port in the switch UI is
    exported, so a dashboard can say `doorbell-camera` instead of `port 4`. For a
    Plus switch, with no SNMP and no readable MAC table, this is the only
@@ -51,11 +53,37 @@ data:
 | `netgear_plus_port_speed_mbps` | gauge | `switch`, `port` | negotiated speed, 0 when down |
 | `netgear_plus_port_rx_bytes_total` | counter | `switch`, `port` | bytes received |
 | `netgear_plus_port_tx_bytes_total` | counter | `switch`, `port` | bytes transmitted |
-| `netgear_plus_port_crc_errors_total` | counter | `switch`, `port` | CRC error frames |
+| `netgear_plus_port_crc_errors_total` | counter | `switch`, `port` | CRC error frames; raw path only, see below |
 
 The port description is a label on its **own** `netgear_plus_port_info` metric,
 not on the numeric series. Renaming a port in the switch UI would otherwise
 orphan every existing time series for that port.
+
+**CRC is exported only on the raw path.** `get_switch_infos()` does carry a
+`port_N_crc_errors` key, but it is a per-interval *delta* clamped at zero, not
+a cumulative count. Three separate things are wrong with it as a counter:
+
+- **The first interval of a failure is invisible.** Upstream reports `0`
+  whenever the *previous* reading was `0`, so a port that has been clean until
+  now reports nothing on the interval its cable starts failing. This is the
+  same property that keeps the `speed_*` family out, below.
+- **`increase()` is not a count of anything.** A burst confined to one interval
+  is added back by the counter-reset correction and comes out about right; a
+  burst spanning consecutive intervals silently undercounts, since `0, 3, 3, 0`
+  yields 3 rather than 6; and for a cable failing at a *steady* rate, with
+  every interval carrying the same non-zero delta, the series never rises and
+  `increase()` returns exactly **0**, silent in the case the alert exists to
+  catch.
+- **Only one port has the key.** Upstream writes it outside its per-port loop,
+  so the last port is the only one that gets a value.
+
+A switch-wide `sum_port_crc_errors` does reach the public dict for every port,
+but it carries the same delta pathology and collapses the per-port attribution
+that is the whole diagnostic value of CRC, so it is not exported either.
+
+On the fallback path the series is therefore **absent**, which is honest; a
+lone delta wearing a `_total` suffix would not be. Alert on
+`netgear_plus_raw_counters == 0` if CRC monitoring matters to you.
 
 **The counter path is latched at the first successful scrape.** Raw and
 fallback derive the same series two ways that disagree by up to 5 kB, half
@@ -67,11 +95,16 @@ appears while the fallback is latched, it is picked up at the next restart.
 `netgear_plus_raw_counters` reports the path the exported counters actually
 use.
 
-> **Renaming in 0.2.0.** `netgear_plus_switch_response_seconds` becomes
-> `netgear_plus_library_sample_interval_seconds`; `0.1.1` and earlier export
-> the old name. It called the value a switch-reported response time and it was
-> never either. Update any dashboard or alert referring to it; the value
-> itself is unchanged.
+> **Changing in 0.2.0.** Two breaks, both affecting dashboards and alerts:
+>
+> - `netgear_plus_switch_response_seconds` becomes
+>   `netgear_plus_library_sample_interval_seconds`; `0.1.1` and earlier export
+>   the old name. It called the value a switch-reported response time and it
+>   was never either. The value itself is unchanged.
+> - `netgear_plus_port_crc_errors_total` disappears on the fallback path
+>   (`netgear_plus_raw_counters 0`). `0.1.1` exported a single per-interval
+>   delta there, for one port; see the CRC note above for why that was worse
+>   than nothing.
 
 `netgear_plus_library_sample_interval_seconds` is the gap between the library's
 **last two polls** of the switch, measured from the end of the previous poll
@@ -181,13 +214,15 @@ NETGEAR_EXPORTER_HOST=192.168.1.2 NETGEAR_EXPORTER_PASSWORD=secret \
 ```
 
 Check `netgear_plus_raw_counters` in the output: **1** means the unrounded
-counter path works on your switch, **0** means it fell back to rescaled megabyte
-values and CRC data will be incomplete.
+counter path works on your switch, **0** means it fell back to rescaled
+megabyte values, in which case **no** CRC series is exported at all, rather
+than a partial one (see the metrics table note).
 
 ## Useful queries
 
 ```promql
 # a cable going bad: CRC errors appearing on a port
+# (only meaningful while netgear_plus_raw_counters is 1; see Metrics)
 increase(netgear_plus_port_crc_errors_total[1h]) > 0
 
 # a gigabit-capable link that negotiated 100 Mbit

@@ -7,10 +7,9 @@ per-model HTML quirks.
 Two data paths are used deliberately:
 
 * **Counters** (rx/tx bytes, CRC errors) are read from the library's *parser*
-  layer, which returns raw integers. The library's public ``get_switch_infos()``
-  converts those to megabytes via ``round(v * 1e-6, 2)`` -- quantising to 10 kB
-  and destroying ``rate()`` precision on a quiet link. A counter must not be
-  rounded, so the parser output is used directly.
+  layer. ``get_switch_infos()`` rounds the byte counters to megabytes, and
+  reports CRC as a per-interval delta for one port; the parser returns the
+  byte counters unrounded and CRC cumulative, for every port.
 * **Everything else** (link state, negotiated speed, port description, firmware,
   serial) comes from ``get_switch_infos()``, where rounding is irrelevant.
 
@@ -233,25 +232,12 @@ class NetgearSwitchCollector(Collector):
     def _effective_raw(self, raw: dict[str, list[int]] | None) -> dict[str, list[int]] | None:
         """Latch the counter derivation chosen on the first successful scrape.
 
-        Raw and fallback derive the same counter series two different ways,
-        and the two disagree by up to 5 kB -- half the fallback's 10 kB
-        rounding quantum. Switching mid-series can move a counter DOWN, which
-        Prometheus reads as a counter reset: increase() then credits the whole
-        counter value as new traffic, and that corruption sits in the TSDB
-        long after the flip. So the path is chosen once:
+        The two derivations differ by up to 5 kB, so switching between them
+        mid-series corrupts the counter -- see the latch note in README.md.
 
-        - raw latched, raw lost: the scrape fails (netgear_plus_up 0) rather
-          than emitting differently-derived values into the same series.
-        - fallback latched, raw appears: fallback continues -- the byte series
-          keep their derivation and stay monotone -- and a restart upgrades.
-
-        A failed scrape latches nothing, so a switch that is briefly
-        unreachable at startup still gets the raw path once it answers.
-        The check-and-set is serialised by a lock: concurrent collects
-        usually share one cached reading, but two first-ever collects
-        straddling a cache expiry can hold readings that differ in raw
-        availability, and unserialised they would latch last-writer-wins
-        after one had already exported the losing derivation.
+        - raw latched, raw lost: the scrape fails (netgear_plus_up 0).
+        - fallback latched, raw appears: fallback continues; a restart upgrades.
+        - a failed scrape latches nothing.
         """
         with self._latch_lock:
             if self._raw_latched is None:
@@ -375,7 +361,8 @@ class NetgearSwitchCollector(Collector):
         crc = CounterMetricFamily(
             "netgear_plus_port_crc_errors",
             "CRC error frames counted on the port. A rising value means a bad "
-            "cable, connector or port -- not congestion.",
+            "cable, connector or port -- not congestion. Absent when "
+            "netgear_plus_raw_counters is 0.",
             labels=["switch", "port"],
         )
 
@@ -425,13 +412,8 @@ class NetgearSwitchCollector(Collector):
             value = infos.get(f"port_{index}_{key}_mbytes")
             return None if value is None else float(value) * BYTES_PER_MEGABYTE
 
-        # crc_errors has no megabyte form; it is simply absent on this path.
-        crc_value = infos.get(f"port_{index}_crc_errors")
-        return (
-            rescaled("sum_rx"),
-            rescaled("sum_tx"),
-            None if crc_value is None else float(crc_value),
-        )
+        # CRC is deliberately not exported here -- see the CRC note in README.md.
+        return rescaled("sum_rx"), rescaled("sum_tx"), None
 
     @staticmethod
     def _infer_port_count(infos: dict[str, Any]) -> int:
