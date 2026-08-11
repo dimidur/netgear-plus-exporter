@@ -81,8 +81,10 @@ about it.
 ## A note on the upstream binding
 
 Raw counters and per-port CRC come from `NetgearSwitchConnector._get_port_statistics()`,
-a non-public method. That is a conscious trade: the public API rounds, and CRC,
-the metric that actually tells you a cable is failing, never reaches it.
+a non-public method. That is a conscious trade: the public API rounds the byte
+counters, and CRC, the metric that actually tells you a cable is failing,
+reaches it only as a per-interval delta, for one port. See the CRC note in the
+README.
 
 The binding is guarded two ways: a test asserts the method still exists, and the
 exporter falls back to the rounded values rather than crashing if it disappears.
