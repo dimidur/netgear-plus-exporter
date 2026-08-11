@@ -16,7 +16,17 @@ WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY netgear_plus_exporter ./netgear_plus_exporter
-RUN python -m pip install --no-cache-dir .
+
+# pip is removed once it has done its job. Nothing at runtime needs it: the
+# entrypoint is a console script and the healthcheck calls python directly.
+#
+# It is not merely surplus. Trivy fails the build on pip's *vendored* copies
+# of msgpack and pkg_resources, and neither a newer base nor a newer pip
+# helps: the base is current, and pip 26.2.1 still vendors msgpack==1.1.2 and
+# setuptools==70.3.0, the flagged versions. Removing pip removes the finding
+# at its source instead of waiting for pip to re-vendor.
+RUN python -m pip install --no-cache-dir . \
+    && python -m pip uninstall -y pip
 
 # Unprivileged: the exporter only makes outbound HTTP calls and binds one port.
 RUN adduser -S -u 65533 exporter
