@@ -1,22 +1,22 @@
 """Prometheus exporter for NETGEAR Plus / Easy Smart Managed switches.
 
 These switches expose no SNMP. Everything here comes from scraping the web UI,
-via :mod:`py_netgear_plus`, which handles the login handshake and the
-per-model HTML quirks.
+via :mod:`py_netgear_plus`.
 
-Two data paths are used deliberately:
+Counters (rx/tx bytes, CRC errors) are read from the statistics the library
+parsed during its own poll and retained, which are unrounded, cumulative and
+per port. Link state, speed, descriptions and switch identity come from
+``get_switch_infos()``, whose byte counters are rounded to megabytes and whose
+CRC is a per-interval delta for a single port.
 
-* **Counters** (rx/tx bytes, CRC errors) are read from the library's *parser*
-  layer. ``get_switch_infos()`` rounds the byte counters to megabytes, and
-  reports CRC as a per-interval delta for one port; the parser returns the
-  byte counters unrounded and CRC cumulative, for every port.
-* **Everything else** (link state, negotiated speed, port description, firmware,
-  serial) comes from ``get_switch_infos()``, where rounding is irrelevant.
+The library substitutes the previous poll's value for a byte counter that
+parses negative on a connected port, so ``sum_rx`` and ``sum_tx`` are
+post-repair while ``crc_errors`` is not. It logs ``Fallback to previous data``
+at INFO when that fires.
 
-The parser layer is not a stable public API, so it is probed defensively; a
-fallback to the megabyte values scaled back to bytes exists, but whether it is
-used is decided once per process -- see ``NetgearSwitchCollector._effective_raw``.
-``netgear_plus_raw_counters`` reports which path produced the exported data.
+Rescaling the rounded megabyte values is the fallback when the retained
+statistics cannot be read. ``netgear_plus_raw_counters`` reports which path
+produced the exported data.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import os
 import threading
 import time
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Protocol
 
 import py_netgear_plus
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
@@ -36,21 +36,70 @@ _LOGGER = logging.getLogger(__name__)
 
 BYTES_PER_MEGABYTE = 1_000_000  # py_netgear_plus uses decimal MB (1e-6)
 
+# Upstream's field names in the retained statistics.
+_BYTE_KEYS = ("sum_rx", "sum_tx")
+_COUNTER_KEYS = (*_BYTE_KEYS, "crc_errors")
+
+# Latch keys for _log_degraded, which fills the first "%s" in each with the
+# host; that placeholder need not be at the start of the sentence.
+_REASON_INCOMPLETE_POLL = (
+    "%s did not complete a full poll, so the retained statistics are from an "
+    "earlier one; not trusting the raw path"
+)
+_REASON_NO_RETAINED_DATA = (
+    "raw counter path unavailable for %s; the collector decides whether to "
+    "fall back or fail the scrape -- see netgear_plus_raw_counters and "
+    "netgear_plus_up"
+)
+_REASON_MISSING_LISTS = (
+    "retained statistics for %s are missing the counter lists; not trusting the raw path"
+)
+_REASON_ROW_COUNT = (
+    "statistics row count disagrees with the port count for %s: %s has %d "
+    "rows for %d ports; not trusting the raw path"
+)
+
+
+class _UpstreamConnector(Protocol):
+    """The ``py_netgear_plus.NetgearSwitchConnector`` methods this exporter calls.
+
+    Nothing here is checked against upstream: the library ships no ``py.typed``,
+    so its objects are ``Any`` to mypy and ``_connect`` returning one as this
+    type passes without a structural test. Calls made through the annotation
+    are checked, so ``get_switch_infos()`` yields ``dict[str, Any]`` downstream.
+
+    Attributes are absent on purpose. Every one this exporter reads, public
+    and private alike, is fetched with ``getattr`` at the point of use, and a
+    declaration here would assert a shape the guards there deliberately
+    re-check.
+    """
+
+    def autodetect_model(self) -> Any: ...
+
+    def get_login_cookie(self) -> bool: ...
+
+    def get_switch_infos(self) -> dict[str, Any]: ...
+
+
+def _poll_timestamp(connector: _UpstreamConnector) -> float:
+    """The library's marker for when it last completed a full poll.
+
+    Missing, renamed or unset, it reads as 0.0, which the freshness check
+    treats as an unmoved timestamp.
+    """
+    return float(getattr(connector, "_previous_timestamp", 0.0) or 0.0)
+
 
 def _bytes_went_all_zero(
     previous: dict[str, list[int]] | None, current: dict[str, list[int]]
 ) -> bool:
     """True when every rx/tx byte counter is zero but the previous reading
-    had traffic somewhere.
-
-    CRC counters are excluded on both sides: all-zero CRC is the healthy
-    steady state, so it can neither establish "there was data before" nor
-    count against the current reading.
+    had traffic somewhere. CRC is excluded from both sides.
     """
     if previous is None:
         return False
-    had_traffic = any(any(previous.get(key) or []) for key in ("sum_rx", "sum_tx"))
-    all_zero_now = not any(any(current.get(key) or []) for key in ("sum_rx", "sum_tx"))
+    had_traffic = any(any(previous.get(key) or []) for key in _BYTE_KEYS)
+    all_zero_now = not any(any(current.get(key) or []) for key in _BYTE_KEYS)
     return had_traffic and all_zero_now
 
 
@@ -72,12 +121,13 @@ class NetgearSwitchScraper:
         self.name = name or host
         self.cache_seconds = cache_seconds
         self._password = password
-        self._connector: Any | None = None
+        self._connector: _UpstreamConnector | None = None
         self._lock = threading.Lock()
         self._cached: dict[str, Any] | None = None
         self._cached_at = 0.0
+        self._warned: set[str] = set()
 
-    def _connect(self) -> Any:
+    def _connect(self) -> _UpstreamConnector:
         connector = py_netgear_plus.NetgearSwitchConnector(self.host, self._password)
         connector.autodetect_model()
         if not connector.get_login_cookie():
@@ -85,62 +135,65 @@ class NetgearSwitchScraper:
             raise SwitchScrapeError(msg)
         return connector
 
+    def _log_degraded(self, message: str, *args: object) -> None:
+        """Warn once per reason, then drop to debug. The latch never resets.
+
+        ``message`` is the latch key, so it must be a ``_REASON_*`` constant
+        and never an f-string, which would make every distinct value a new
+        key. This supplies the host for the first ``%s``; ``args`` fill the
+        rest. A placeholder mismatch is a stderr notice rather than an
+        exception, so it loses the message silently.
+        """
+        level = logging.DEBUG if message in self._warned else logging.WARNING
+        self._warned.add(message)
+        _LOGGER.log(level, message, self.host, *args)
+
     def _raw_port_statistics(
-        self, connector: Any, previous_raw: dict[str, list[int]] | None
+        self,
+        connector: _UpstreamConnector,
+        polled_before: float,
+        previous_raw: dict[str, list[int]] | None,
     ) -> dict[str, list[int]] | None:
         """Return unrounded per-port counters, or None if unavailable.
 
-        Reaches into the library's fetch/parse layer on purpose -- see module
-        docstring. A structural change upstream lands here as None and the
-        collector decides what that means.
+        Reads what the poll already parsed; it issues no request of its own.
 
-        Two integrity checks guard against a parse break that still produces
-        well-typed output. The parser pads short lists with zeros to exactly
-        the port count, so a truncated statistics page arrives type-correct,
-        length-correct and zeroed -- with every health signal green:
+        ``polled_before`` is the poll timestamp read before
+        ``get_switch_infos()``. The library refreshes that timestamp and the
+        parsed data together at the end of a successful poll, and returns
+        before both when ``switch_model.SUPPORTED`` is false, so an unmoved
+        timestamp means the retained data belongs to an older poll. No model
+        sets that flag false at the pinned version.
 
-        - A list whose length disagrees with the port count (padding only
-          extends, so this means EXTRA rows -- a header parsed as data, a
-          model variant) is not trusted: None, and the collector decides.
-        - Byte counters all reading zero right after a reading that was not
-          zero is a parse break until proven otherwise, and raises. A
-          reboot or a manual counter clear produces the same transition
-          legitimately; those fail scrapes until rx/tx bytes move again --
-          seconds on a switch passing traffic, and CRC movement alone does
-          not count -- where trusting a broken parse costs silently flat
-          traffic with ``netgear_plus_up`` still 1.
+        The parser pads short lists with zeros to exactly the port count, so
+        a truncated statistics page arrives type-correct, length-correct and
+        zeroed. Two checks catch that: a row count disagreeing with the port
+        count returns None, and byte counters that all read zero immediately
+        after a non-zero reading raise. Neither sees a break that yields
+        negative counters, which the library repairs into a plateau first.
         """
-        try:
-            # Single upstream entry point: it picks the HTML or JSON-API path per
-            # model and returns the parser output before any megabyte rounding.
-            parsed = connector._get_port_statistics()  # noqa: SLF001
-        except Exception:
-            _LOGGER.warning(
-                "raw counter path unavailable for %s; the collector decides "
-                "whether to fall back or fail the scrape -- see "
-                "netgear_plus_raw_counters and netgear_plus_up",
-                self.host,
-                exc_info=True,
-            )
+        if _poll_timestamp(connector) == polled_before:
+            self._log_degraded(_REASON_INCOMPLETE_POLL)
             return None
-        if not isinstance(parsed, dict):
+        # The parser output the poll retained, before any megabyte rounding.
+        parsed = getattr(connector, "_previous_data", None)
+        if not isinstance(parsed, dict) or not parsed:
+            self._log_degraded(_REASON_NO_RETAINED_DATA)
             return None
-        wanted = ("sum_rx", "sum_tx", "crc_errors")
-        if not all(isinstance(parsed.get(key), list) for key in wanted):
+        if not all(isinstance(parsed.get(key), list) for key in _COUNTER_KEYS):
+            self._log_degraded(_REASON_MISSING_LISTS)
             return None
         ports = int(getattr(connector, "ports", 0) or 0)
-        if ports and any(len(parsed[key]) != ports for key in wanted):
-            mismatched_key = next(key for key in wanted if len(parsed[key]) != ports)
-            _LOGGER.warning(
-                "statistics row count disagrees with the port count for %s: "
-                "%s has %d rows for %d ports; not trusting the raw path",
-                self.host,
+        if ports and any(len(parsed[key]) != ports for key in _COUNTER_KEYS):
+            mismatched_key = next(key for key in _COUNTER_KEYS if len(parsed[key]) != ports)
+            self._log_degraded(
+                _REASON_ROW_COUNT,
                 mismatched_key,
                 len(parsed[mismatched_key]),
                 ports,
             )
             return None
-        raw = {key: [int(value or 0) for value in parsed[key]] for key in wanted}
+        raw = {key: [int(value or 0) for value in parsed[key]] for key in _COUNTER_KEYS}
         if _bytes_went_all_zero(previous_raw, raw):
             msg = (
                 f"all byte counters read zero on {self.host} right after a "
@@ -163,15 +216,17 @@ class NetgearSwitchScraper:
             started = time.monotonic()
             if self._connector is None:
                 self._connector = self._connect()
+            polled_before = _poll_timestamp(self._connector)
             try:
                 infos = self._connector.get_switch_infos()
             except Exception:  # noqa: BLE001 - several unrelated types mean "poll failed"
-                # The library refreshes an expired cookie in place, so reaching
-                # here means the poll failed for some other reason -- a login it
-                # could not recover, an unreachable switch, a page that would
-                # not load or parse. Rebuild the session once before giving up.
+                # Rebuild the session once before giving up. The library
+                # refreshes an expired cookie in place, so an exception here is
+                # some other failure.
                 _LOGGER.info("reconnecting to %s after a failed poll", self.host)
                 self._connector = self._connect()
+                # The replacement connector carries its own timestamp.
+                polled_before = _poll_timestamp(self._connector)
                 infos = self._connector.get_switch_infos()
 
             if not infos:
@@ -182,6 +237,7 @@ class NetgearSwitchScraper:
                 "infos": infos,
                 "raw": self._raw_port_statistics(
                     self._connector,
+                    polled_before,
                     (self._cached or {}).get("raw"),
                 ),
                 "ports": int(getattr(self._connector, "ports", 0) or 0),
@@ -198,14 +254,10 @@ class NetgearSwitchCollector(Collector):
 
     def __init__(self, scraper: NetgearSwitchScraper) -> None:
         self.scraper = scraper
-        # None until the first successful scrape, then latched to the counter
-        # derivation chosen there -- see _effective_raw.
+        # None until the first successful scrape, then the derivation it used.
         self._raw_latched: bool | None = None
         self._upgrade_logged = False
-        # Serialises the latch check-and-set: without it, two concurrent
-        # first-ever collects straddling a cache expiry could hold readings
-        # that differ in raw availability and latch last-writer-wins --
-        # after one of them already exported the losing derivation.
+        # Serialises the latch check-and-set against concurrent collects.
         self._latch_lock = threading.Lock()
 
     def collect(self) -> Iterator[Metric]:
@@ -231,9 +283,6 @@ class NetgearSwitchCollector(Collector):
 
     def _effective_raw(self, raw: dict[str, list[int]] | None) -> dict[str, list[int]] | None:
         """Latch the counter derivation chosen on the first successful scrape.
-
-        The two derivations differ by up to 5 kB, so switching between them
-        mid-series corrupts the counter -- see the latch note in README.md.
 
         - raw latched, raw lost: the scrape fails (netgear_plus_up 0).
         - fallback latched, raw appears: fallback continues; a restart upgrades.
@@ -273,8 +322,7 @@ class NetgearSwitchCollector(Collector):
         duration.add_metric([switch], reading["duration"])
         yield duration
 
-        # Reports the path the exported counters actually use -- the latched
-        # one -- not whatever this reading happened to carry.
+        # Reports the latched path, not whatever this reading carried.
         raw_family = GaugeMetricFamily(
             "netgear_plus_raw_counters",
             "1 when byte counters come from the unrounded parser path, "
@@ -285,16 +333,9 @@ class NetgearSwitchCollector(Collector):
         yield raw_family
 
         # Upstream sets response_time_s to `_start_time - _previous_timestamp`,
-        # and resets _previous_timestamp only after a poll completes, so it is
-        # the gap between polls rather than the time the switch took to answer.
-        #
-        # The first sample of any connection is not a poll interval at all:
-        # _previous_timestamp is set in the connector's __init__, before
-        # autodetect and login, so it spans those plus the metadata and
-        # port-status fetches and the library's two 0.25s inter-request sleeps.
-        # That happens once at process start and again whenever a failed poll
-        # forces a reconnect -- but never on routine session expiry, which the
-        # library handles by refreshing the cookie on the same connector.
+        # so it is the gap between polls, not the switch's response time. The
+        # first sample of a connection instead spans autodetect and login,
+        # which recurs whenever a failed poll forces a reconnect.
         sample_interval = infos.get("response_time_s")
         if sample_interval is not None:
             interval = GaugeMetricFamily(
@@ -330,9 +371,6 @@ class NetgearSwitchCollector(Collector):
         infos = reading["infos"]
         ports = reading["ports"] or self._infer_port_count(infos)
 
-        # The port description is a LABEL on its own info metric rather than on
-        # the numeric series: renaming a port in the switch UI would otherwise
-        # orphan every existing time series for that port.
         port_info = GaugeMetricFamily(
             "netgear_plus_port_info",
             "Per-port metadata; value is always 1.",
@@ -412,7 +450,7 @@ class NetgearSwitchCollector(Collector):
             value = infos.get(f"port_{index}_{key}_mbytes")
             return None if value is None else float(value) * BYTES_PER_MEGABYTE
 
-        # CRC is deliberately not exported here -- see the CRC note in README.md.
+        # No CRC on the fallback path.
         return rescaled("sum_rx"), rescaled("sum_tx"), None
 
     @staticmethod

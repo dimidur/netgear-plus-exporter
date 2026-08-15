@@ -7,8 +7,11 @@ rounding fallback, port-count inference -- are pinned down.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
+from netgear_plus_exporter import exporter
 from netgear_plus_exporter.exporter import (
     NetgearSwitchCollector,
     NetgearSwitchScraper,
@@ -94,7 +97,7 @@ def _raw():
 
 def _zeros():
     """Fresh lists every call: a shared constant would alias mutations."""
-    return {key: [0] * PORTS for key in ("sum_rx", "sum_tx", "crc_errors")}
+    return {key: [0] * PORTS for key in exporter._COUNTER_KEYS}
 
 
 def _collector(*readings):
@@ -289,12 +292,10 @@ def test_upgrade_notice_is_logged_exactly_once(caplog):
     every collect: ~2,900 lines per day at a 30s scrape interval, forever.
     """
     # Arrange
-    import logging
-
     collector = _collector(_reading(), _reading(raw=RAW))
 
     # Act -- two rounds in the upgrade condition.
-    with caplog.at_level(logging.INFO, logger="netgear_plus_exporter.exporter"):
+    with caplog.at_level(logging.INFO, logger=exporter._LOGGER.name):
         _families(collector)
         _families(collector)
         _families(collector)
@@ -339,37 +340,150 @@ def test_port_count_is_inferred_when_connector_does_not_report_it():
     assert len(families["netgear_plus_port_up"].samples) == PORTS
 
 
-def test_upstream_private_entry_point_still_exists():
-    """Guards the one binding to a non-public upstream API.
+def test_upstream_private_attributes_still_exist():
+    """Guards the binding to non-public upstream state.
 
-    Unrounded counters and per-port CRC both come from
-    NetgearSwitchConnector._get_port_statistics(). If a py-netgear-plus release
-    renames or removes it, the exporter degrades to rounded megabyte values and
-    no CRC at all -- which is exactly the failure this project exists to avoid,
-    and it is invisible without a switch to test against. This catches the
-    rename in CI, with no hardware.
+    Unrounded counters and per-port CRC come from the statistics the library
+    retains after its own poll, and whether that data belongs to this poll is
+    judged by the timestamp it refreshes alongside. If a py-netgear-plus
+    release renames or drops either, the exporter degrades to rounded
+    megabyte values and no CRC at all, which is exactly the failure this
+    project exists to avoid, and it is invisible without a switch to test
+    against. This catches the rename in CI, with no hardware.
+
+    Both are set in __init__, so the class-level check is on an instance.
     """
     # Arrange
     import py_netgear_plus
 
-    # Act + Assert
-    assert hasattr(py_netgear_plus.NetgearSwitchConnector, "_get_port_statistics")
+    connector = py_netgear_plus.NetgearSwitchConnector("192.0.2.1", "unused")
+
+    # Act + Assert -- the names survive...
+    assert hasattr(connector, "_previous_data")
+    assert hasattr(connector, "_previous_timestamp")
+
+    # ...and _previous_data still carries the three counter lists. A release
+    # that kept the attribute but moved the statistics elsewhere would pass a
+    # name check while silently dropping this exporter to rounded megabytes.
+    connector._set_instance_attributes_by_model(py_netgear_plus.models.GS305E)
+    for key in ("sum_rx", "sum_tx", "crc_errors"):
+        assert isinstance(connector._previous_data[key], list)
+
+
+def test_upstream_still_assigns_the_retained_pair_after_the_supported_return():
+    """Pins the source ordering the freshness guard depends on.
+
+    `_raw_port_statistics` treats an unmoved `_previous_timestamp` as proof
+    that the retained data is from an earlier poll. That holds only while
+    upstream assigns the timestamp and the data together, after the early
+    return for an unsupported model. Hoisting the timestamp above that return
+    is a plausible refactor, since upstream reads it only for `sample_time`,
+    and it would turn the guard into a no-op that exports a zero-filled
+    reseed as live data.
+
+    Reads source text, so it is brittle by design: a bump that reformats this
+    method should fail here and be re-verified by hand.
+    """
+    # Arrange
+    import inspect
+
+    import py_netgear_plus
+
+    lines = [
+        line.strip()
+        for line in inspect.getsource(
+            py_netgear_plus.NetgearSwitchConnector.get_switch_infos
+        ).splitlines()
+    ]
+
+    # Act
+    supported_guard = lines.index("if not self.switch_model.SUPPORTED:")
+    timestamp_assignment = next(
+        index for index, line in enumerate(lines) if line.startswith("self._previous_timestamp =")
+    )
+
+    # Assert
+    assert lines[supported_guard + 1] == "return switch_data"
+    assert timestamp_assignment > supported_guard
+    assert lines[timestamp_assignment + 1].startswith("self._previous_data =")
 
 
 class _StubConnector:
-    """The two attributes _raw_port_statistics reads, with no network."""
+    """What _raw_port_statistics reads, with no network.
 
-    def __init__(self, parsed, ports=PORTS):
-        self._parsed = parsed
+    `_previous_data` and `_previous_timestamp` are the retained-poll pair the
+    library updates together at the end of a successful poll. `polled_before`
+    in the tests is the timestamp taken before that poll, so a stub whose
+    timestamp differs is modelling a poll that completed.
+    """
+
+    def __init__(self, parsed, ports=PORTS, timestamp=1.0):
+        self._previous_data = parsed
+        self._previous_timestamp = timestamp
         self.ports = ports
 
-    def _get_port_statistics(self):
-        return self._parsed
+
+# A poll timestamp from BEFORE the stub's, so the guard sees a poll that
+# completed and the retained data as current.
+EARLIER_POLL = 0.0
 
 
 def _scraper():
     # No I/O happens in __init__; the connection is only built inside scrape().
     return NetgearSwitchScraper("192.0.2.1", "unused")
+
+
+def test_each_degraded_reason_warns_once_then_drops_to_debug(caplog):
+    """A condition that degrades a scrape degrades every scrape. Unlatched,
+    that is thousands of identical WARNING lines a day at a 30s interval.
+
+    The latch is per reason, not per scraper: the third call takes a different
+    branch and must warn, even though an earlier reason has already latched.
+    """
+    # Arrange -- one stub with no counter lists, one with too many rows.
+    scraper = _scraper()
+    no_lists = _StubConnector({"something": "else"})
+    extra_rows = _StubConnector({key: [0] * (PORTS + 1) for key in RAW})
+
+    # Act -- one reason twice, then a second reason twice.
+    with caplog.at_level(logging.DEBUG, logger=exporter._LOGGER.name):
+        scraper._raw_port_statistics(no_lists, EARLIER_POLL, None)
+        scraper._raw_port_statistics(no_lists, EARLIER_POLL, None)
+        scraper._raw_port_statistics(extra_rows, EARLIER_POLL, None)
+        scraper._raw_port_statistics(extra_rows, EARLIER_POLL, None)
+
+    # Assert -- filtered by logger, since py_netgear_plus logs on its own.
+    # The fourth call is what proves the second reason latched rather than
+    # merely warned once.
+    levels = [record.levelname for record in caplog.records if record.name == exporter._LOGGER.name]
+    assert levels == ["WARNING", "DEBUG", "WARNING", "DEBUG"]
+
+
+def test_an_empty_retained_dict_is_rejected_as_unavailable():
+    """`_previous_data` is `{}` between `__init__` and `autodetect_model()`,
+    and an empty dict passes an isinstance check.
+
+    The exporter's own `_connect()` always autodetects, so this shape is not
+    reachable through it today: it guards an upstream change that leaves the
+    dict empty after a poll.
+
+    Both this and the missing-lists branch return None and log, so asserting
+    only "None and something was logged" cannot tell them apart and passes
+    even with the emptiness check removed. The reason is what is pinned: an
+    empty dict means the path is unavailable, not that the payload arrived
+    malformed.
+    """
+    # Arrange -- a connector whose poll never completed.
+    scraper = _scraper()
+    never_polled = _StubConnector({})
+
+    # Act
+    raw = scraper._raw_port_statistics(never_polled, EARLIER_POLL, None)
+
+    # Assert -- pinned to the reason constant, so rewording the message
+    # cannot break this and a message that merely resembles it cannot pass.
+    assert raw is None
+    assert scraper._warned == {exporter._REASON_NO_RETAINED_DATA}
 
 
 def test_statistics_with_extra_rows_are_not_trusted():
@@ -386,7 +500,7 @@ def test_statistics_with_extra_rows_are_not_trusted():
     }
 
     # Act
-    raw = _scraper()._raw_port_statistics(_StubConnector(parsed), None)
+    raw = _scraper()._raw_port_statistics(_StubConnector(parsed), EARLIER_POLL, None)
 
     # Assert
     assert raw is None
@@ -397,7 +511,7 @@ def test_correct_length_statistics_pass_the_guard():
     parsed = _raw()
 
     # Act
-    raw = _scraper()._raw_port_statistics(_StubConnector(parsed), None)
+    raw = _scraper()._raw_port_statistics(_StubConnector(parsed), EARLIER_POLL, None)
 
     # Assert
     assert raw == RAW
@@ -411,7 +525,7 @@ def test_length_guard_is_skipped_when_the_port_count_is_unknown():
     parsed = _raw()
 
     # Act
-    raw = _scraper()._raw_port_statistics(_StubConnector(parsed, ports=0), None)
+    raw = _scraper()._raw_port_statistics(_StubConnector(parsed, ports=0), EARLIER_POLL, None)
 
     # Assert
     assert raw == RAW
@@ -428,7 +542,7 @@ def test_all_zero_bytes_after_traffic_fail_the_scrape():
 
     # Act + Assert
     with pytest.raises(SwitchScrapeError, match="parse break"):
-        _scraper()._raw_port_statistics(connector, RAW)
+        _scraper()._raw_port_statistics(connector, EARLIER_POLL, RAW)
 
 
 def test_all_zero_bytes_with_no_history_are_a_valid_reading():
@@ -436,7 +550,7 @@ def test_all_zero_bytes_with_no_history_are_a_valid_reading():
     zeros = _zeros()
 
     # Act
-    raw = _scraper()._raw_port_statistics(_StubConnector(zeros), None)
+    raw = _scraper()._raw_port_statistics(_StubConnector(zeros), EARLIER_POLL, None)
 
     # Assert
     assert raw == zeros
@@ -462,19 +576,151 @@ def test_zero_transition_ignores_crc_history():
 
 
 class _StubPollingConnector:
-    """Enough connector for scrape() to run without any network."""
+    """Enough connector for scrape() to run without any network.
+
+    Models the library's contract: a poll that completes refreshes the
+    retained statistics and the timestamp together, and one that returns
+    early refreshes neither.
+
+    It deliberately has no _get_port_statistics, so a second fetch would
+    raise here rather than pass silently.
+    """
 
     ports = PORTS
     switch_model = None
 
-    def __init__(self, stats_sequence):
+    def __init__(self, stats_sequence, *, completes=True):
         self._stats = stats_sequence
+        self._completes = completes
+        self._previous_data: dict = {}
+        self._previous_timestamp = 0.0
+        self.polls = 0
 
     def get_switch_infos(self):
+        self.polls += 1
+        if self._completes:
+            self._previous_data = self._stats.pop(0) if len(self._stats) > 1 else self._stats[0]
+            self._previous_timestamp += 1.0
         return {"switch_ip": "192.0.2.1"}
 
-    def _get_port_statistics(self):
-        return self._stats.pop(0) if len(self._stats) > 1 else self._stats[0]
+
+def test_one_scrape_polls_the_switch_once():
+    """One poll per scrape, not two. See docs/own-the-protocol.md for why a
+    duplicate fetch is a real cost on this hardware.
+
+    The stub has no _get_port_statistics, so a second fetch raises rather
+    than passing quietly.
+    """
+    # Arrange
+    scraper = NetgearSwitchScraper("192.0.2.1", "unused", cache_seconds=0.0)
+    connector = _StubPollingConnector([_raw()])
+    scraper._connector = connector
+
+    # Act
+    reading = scraper.scrape()
+
+    # Assert -- one poll, and the counters came from it.
+    assert connector.polls == 1
+    assert reading["raw"] == RAW
+
+
+def test_an_incomplete_poll_does_not_report_stale_statistics_as_current():
+    """A partially supported model makes get_switch_infos() return before it
+    refreshes either the retained statistics or the timestamp. Reporting the
+    previous poll's counters as this one's would be silent and wrong, so the
+    unmoved timestamp drops the raw path instead.
+    """
+    # Arrange
+    scraper = NetgearSwitchScraper("192.0.2.1", "unused", cache_seconds=0.0)
+    connector = _StubPollingConnector([_raw()], completes=False)
+    connector._previous_data = _raw()  # left over from an earlier poll
+    scraper._connector = connector
+
+    # Act
+    reading = scraper.scrape()
+
+    # Assert
+    assert reading["raw"] is None
+
+
+def test_reconnect_reads_the_timestamp_from_the_replacement_connector(monkeypatch):
+    """time.perf_counter() is process-wide, so a timestamp taken from the
+    connector that failed is still comparable against the one that replaced
+    it, and that is the trap: a fresh connector's __init__ stamp is always
+    greater than the old connector's, so an early-returning poll on the new
+    one would pass the guard and publish its zero-seeded retained data as a
+    live reading.
+
+    Deleting the reassignment in scrape() turns this red.
+    """
+    # Arrange -- first connector fails, replacement never completes a poll.
+    scraper = NetgearSwitchScraper("192.0.2.1", "unused", cache_seconds=0.0)
+
+    class _FailingConnector(_StubPollingConnector):
+        def get_switch_infos(self):
+            raise RuntimeError("poll failed")
+
+    failing = _FailingConnector([_raw()])
+    failing._previous_timestamp = 100.0
+    scraper._connector = failing
+
+    replacement = _StubPollingConnector([_raw()], completes=False)
+    replacement._previous_timestamp = 500.0  # a later __init__ stamp
+    # Zero-filled lists are what _set_instance_attributes_by_model seeds,
+    # reached via autodetect_model() during connect. __init__ alone leaves
+    # _previous_data an empty dict.
+    replacement._previous_data = _zeros()
+    monkeypatch.setattr(scraper, "_connect", lambda: replacement)
+
+    # Act
+    reading = scraper.scrape()
+
+    # Assert -- the incomplete poll is not reported as a reading.
+    assert reading["raw"] is None
+
+
+def test_upstream_repairs_negative_bytes_and_leaves_crc_alone():
+    """Counters now come from the data the library retains, which is
+    post-repair. This pins the two halves of that contract, in memory and
+    without hardware, because a release that started writing back into the
+    crc_errors list would corrupt CRC with every gate still green.
+    """
+    # Arrange
+    import py_netgear_plus
+
+    connector = py_netgear_plus.NetgearSwitchConnector("192.0.2.1", "unused")
+    connector.ports = 2
+    # The keys _update_current_data reads, seeded as a real poll would.
+    connector._previous_data = {
+        "sum_rx": [10, 20],
+        "sum_tx": [30, 40],
+        "crc_errors": [1, 2],
+        "traffic_rx": [0, 0],
+        "traffic_tx": [0, 0],
+    }
+    # Seeded by the library itself, then given the parser's own keys, so the
+    # fixture cannot drift from what a real poll builds.
+    current = connector._initialize_current_data()
+    current.update(
+        {
+            "sum_rx": [-1, 500],  # negative on a connected port
+            "sum_tx": [30, 40],
+            "crc_errors": [5, 6],
+            "traffic_rx": [0, 0],
+            "traffic_tx": [0, 0],
+            "speed_io": [0, 0],
+        }
+    )
+    switch_data = {"port_1_status": "on", "port_2_status": "on"}
+
+    # Act
+    connector._update_current_data(current, switch_data, 1.0)
+
+    # Assert -- the negative is replaced by the previous value...
+    assert current["sum_rx"][0] == 10
+    # ...and CRC comes through byte-identical, which is why the list is read
+    # instead of the per-port delta the public dict carries.
+    assert current["crc_errors"] == [5, 6]
 
 
 def test_scrape_wires_cached_history_and_preserves_it_on_failure():
