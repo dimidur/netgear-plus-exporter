@@ -28,7 +28,7 @@ dev = [
   "pytest==9.1.1",
   "pytest-timeout==2.5.0",
   "ruff==0.16.2",
-  "mypy==1.14.1",
+  "mypy==2.3.1",
   "bandit==1.9.4",
   "pip-audit==2.10.1",
   "yamllint==1.38.0",
