@@ -95,7 +95,7 @@ appears while the fallback is latched, it is picked up at the next restart.
 `netgear_plus_raw_counters` reports the path the exported counters actually
 use.
 
-> **Changing in 0.2.0.** Two breaks, both affecting dashboards and alerts:
+> **Changed in 0.2.0.** Two breaks, both affecting dashboards and alerts:
 >
 > - `netgear_plus_switch_response_seconds` becomes
 >   `netgear_plus_library_sample_interval_seconds`; `0.1.1` and earlier export
@@ -198,7 +198,7 @@ docker run --rm -p 9694:9694 \
   -e NETGEAR_EXPORTER_HOST=192.168.1.2 \
   -e NETGEAR_EXPORTER_PASSWORD=secret \
   -e NETGEAR_EXPORTER_NAME=basement-switch \
-  dimidur/netgear-plus-exporter:0.1.1
+  dimidur/netgear-plus-exporter:0.2.0
 ```
 
 Compose, reading the password from a file so it never appears in `docker inspect`:
@@ -206,7 +206,7 @@ Compose, reading the password from a file so it never appears in `docker inspect
 ```yaml
 services:
   switch-exporter:
-    image: dimidur/netgear-plus-exporter:0.1.1
+    image: dimidur/netgear-plus-exporter:0.2.0
     restart: unless-stopped
     environment:
       NETGEAR_EXPORTER_HOST: 192.168.1.2
