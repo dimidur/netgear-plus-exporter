@@ -26,6 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest==9.1.1",
+  "pytest-timeout==2.5.0",
   "ruff==0.16.2",
   "mypy==1.14.1",
   "bandit==1.9.4",
@@ -53,6 +54,10 @@ ignore = ["ANN401"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The contention tests hold the scraper's lock and then call scrape(). If the
+# non-blocking acquire ever regresses they deadlock, and without this CI hangs
+# to its job timeout instead of reporting a failure.
+timeout = 30
 
 [tool.mypy]
 python_version = "3.13"

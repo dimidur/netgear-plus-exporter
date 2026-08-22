@@ -66,10 +66,15 @@ the first place you will hear about it.
   attributes of `py_netgear_plus.NetgearSwitchConnector`. The tests that pin it
   and the runtime checks that degrade rather than crash both exist because the
   failure is otherwise silent.
+- **Only `upstream.py` may import `py_netgear_plus`.** A change to the
+  library's *API* is then a one-module edit, and `tests/test_structure.py`
+  fails if the import spreads. Note what that does not cover: the collector
+  still reads `get_switch_infos()` keys by their upstream names, so a change
+  to the *wire vocabulary* is a two-module edit and no test sees it.
 - **New labels belong on info metrics.** Port descriptions live on
   `netgear_plus_port_info`, not on the numeric series, so renaming a port in the
   switch UI doesn't orphan its history. Follow that pattern for anything else
-  operator-editable.
+  that can be edited in the switch UI.
 - **Don't make a failure look like health.** A scrape that cannot reach the
   switch reports `netgear_plus_up 0`; a degraded counter path reports
   `netgear_plus_raw_counters 0`.

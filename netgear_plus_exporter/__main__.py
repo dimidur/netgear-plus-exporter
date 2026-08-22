@@ -11,9 +11,58 @@ from types import FrameType
 
 from prometheus_client import CollectorRegistry, generate_latest, start_http_server
 
-from .exporter import NetgearSwitchCollector, NetgearSwitchScraper, read_password
+from .collector import NetgearSwitchCollector
+from .scraper import NetgearSwitchScraper
 
 _LOGGER = logging.getLogger("netgear_plus_exporter")
+
+
+class ConfigError(Exception):
+    """A required setting is missing or unusable.
+
+    Raised rather than exited on, so every configuration fault leaves through
+    one path in main(): the configured log format, at ERROR, with one exit
+    code. Exiting from where the fault is found bypasses both.
+    """
+
+
+def _read_host() -> str:
+    host = os.environ.get("NETGEAR_EXPORTER_HOST")
+    if not host:
+        msg = "NETGEAR_EXPORTER_HOST is required (switch IP or hostname)"
+        raise ConfigError(msg)
+    return host
+
+
+def _read_password() -> str:
+    """Read the switch password, preferring the *_FILE form used by secrets.
+
+    An unreadable or empty secrets file otherwise surfaces much later as a
+    rejected login, which reports a configuration mistake as a bad password.
+    """
+    path = os.environ.get("NETGEAR_EXPORTER_PASSWORD_FILE")
+    if path:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                from_file = handle.read().strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            # UnicodeDecodeError is a ValueError, not an OSError, and a secrets
+            # file written by something that did not expect to be read as text
+            # is a configuration mistake like any other.
+            msg = f"cannot read NETGEAR_EXPORTER_PASSWORD_FILE {path}: {exc}"
+            raise ConfigError(msg) from exc
+        if not from_file:
+            msg = f"NETGEAR_EXPORTER_PASSWORD_FILE {path} is empty"
+            raise ConfigError(msg)
+        return from_file
+    password = os.environ.get("NETGEAR_EXPORTER_PASSWORD")
+    if not password:
+        msg = (
+            "set NETGEAR_EXPORTER_PASSWORD or NETGEAR_EXPORTER_PASSWORD_FILE "
+            "to the switch web-UI password"
+        )
+        raise ConfigError(msg)
+    return password
 
 
 def _env_float(name: str, default: float) -> float:
@@ -30,22 +79,24 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    host = os.environ.get("NETGEAR_EXPORTER_HOST")
-    if not host:
-        _LOGGER.error("NETGEAR_EXPORTER_HOST is required (switch IP or hostname)")
+    try:
+        host = _read_host()
+        password = _read_password()
+    except ConfigError as exc:
+        _LOGGER.error("%s", exc)
         return 2
 
     listen_port = int(_env_float("NETGEAR_EXPORTER_PORT", 9694))
+    switch = os.environ.get("NETGEAR_EXPORTER_NAME") or host
     scraper = NetgearSwitchScraper(
         host=host,
-        password=read_password(),
-        name=os.environ.get("NETGEAR_EXPORTER_NAME") or host,
+        password=password,
         cache_seconds=_env_float("NETGEAR_EXPORTER_CACHE_SECONDS", 30.0),
     )
     # A private registry, not the global default one: keeps the output to this
     # exporter's own metrics with no process/GC collectors mixed in.
     registry = CollectorRegistry()
-    registry.register(NetgearSwitchCollector(scraper))
+    registry.register(NetgearSwitchCollector(scraper, switch=switch, host=host))
 
     # --once: scrape, print the exposition to stdout, exit. Lets you verify a
     # switch without running a server, and gives CI a smoke test.
@@ -54,7 +105,7 @@ def main() -> int:
         return 0
 
     start_http_server(listen_port, registry=registry)
-    _LOGGER.info("serving metrics for %s on :%d", scraper.name, listen_port)
+    _LOGGER.info("serving metrics for %s on :%d", switch, listen_port)
 
     # The exporter is entirely pull-driven; idle until told to stop. Handling
     # SIGTERM explicitly keeps `docker stop` from taking the full 10s grace.

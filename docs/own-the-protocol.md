@@ -89,6 +89,11 @@ types carry over unchanged:
 | `netgear_plus_port_tx_bytes_total` | counter | `switch`, `port` |
 | `netgear_plus_port_crc_errors_total` | counter | `switch`, `port` |
 
+`netgear_plus_scrape_duration_seconds` is how long the last poll of the switch
+took. A collect served from cache republishes that value unchanged: it is not
+re-measured and not zeroed, so the series is the poll cost rather than the
+scrape cost.
+
 Two metrics do **not** carry over, because both describe the old
 implementation rather than the switch:
 
@@ -99,6 +104,38 @@ implementation rather than the switch:
 
 Both are a breaking change and belong under **Breaking Changes** in the
 release that ships this.
+
+### Metrics the rewrite adds
+
+Today a failed scrape is a single `netgear_plus_up 0` covering every cause,
+with the detail reaching only the log. These three are worth having whatever
+the exporter is written in, so they are specified here rather than retrofitted
+onto the implementation being replaced:
+
+| metric | type | labels |
+| --- | --- | --- |
+| `netgear_plus_scrape_errors_total` | counter | `switch`, `reason` |
+| `netgear_plus_last_success_timestamp_seconds` | gauge | `switch` |
+| `netgear_plus_ports` | gauge | `switch` |
+
+`reason` is a small closed set decided at the point of failure: `connect`,
+`login`, `empty`, `parse`, `unknown`. It must stay small, since it is a label.
+
+`netgear_plus_scrape_errors_total` counts **attempts against the device**, not
+scrapes served. A collect that returns a cached failure without touching the
+switch does not increment it, or the metric measures Prometheus's scrape
+interval rather than the failure rate it exists to alert on.
+
+`netgear_plus_ports` exists so that "no ports were found" is a value rather
+than an absence. Today a reading that yields no ports emits no port series at
+all, and `count(netgear_plus_port_up)` over a series that never appeared is
+absent, not zero, so there is nothing for an alert to compare against. A gauge
+that is always emitted gives one.
+
+Reading age is deliberately not a metric.
+`time() - netgear_plus_last_success_timestamp_seconds` is the same number, and
+a gauge that has to be recomputed on every scrape of a cached reading is a
+second thing to keep correct.
 
 ### Behaviour that is not negotiable
 
@@ -115,6 +152,40 @@ release that ships this.
 - **Port descriptions are labels on `netgear_plus_port_info`**, never on a
   numeric series, so renaming a port in the switch UI does not orphan its
   history.
+- **An unreachable switch must not queue collectors behind it.** Serving
+  `/metrics` is concurrent, and a poll against an unreachable switch blocks
+  for the full connect timeout on every request it makes, so a collect that
+  cannot take the poll lock replays the last attempt's outcome instead of
+  waiting for one.
+- **A recorded failure outranks a reading taken before it.** The reading is
+  kept, as the counter history the zero-transition guard compares against,
+  but replaying it would report a dead switch as up. With no attempt at all
+  yet, the cold-start case, the scrape fails rather than inventing one.
+- **Failures are cached under the same TTL as successes**, so a dead switch
+  costs one attempt per interval rather than one per scrape. That is the
+  caching rule under **The device is fragile** applied to failures, which are
+  otherwise the one case that reaches the device on every scrape. The clock
+  starts when an attempt finishes, so the real gap is the poll's own duration
+  plus the TTL.
+
+### Structure
+
+Three packages, one reason to change each. The Python exporter reached five
+in a single module before it was split; this says where the seams go so that
+does not repeat.
+
+- **device binding**: the HTTP session, the login handshake, fetching and
+  parsing pages. Changes when the switch or its firmware changes.
+- **polling**: session lifecycle, the cache, the lock, the failure policy.
+  Changes when the retry or caching policy changes.
+- **metrics**: translation into the contract above. Changes when that
+  contract changes.
+
+Metric translation must not import the device binding **and must not use its
+key names**. Cutting only the import is what the Python exporter did, and it
+leaves a firmware rename as a two-module edit that no test can see: the
+reading crossing the seam should already be in this exporter's own
+vocabulary.
 
 ### Testing
 
