@@ -43,7 +43,7 @@ data:
 
 | metric | type | labels | meaning |
 | --- | --- | --- | --- |
-| `netgear_plus_up` | gauge | `switch` | 1 if the last scrape succeeded |
+| `netgear_plus_up` | gauge | `switch` | 1 when this scrape produced a full reading; see [Failure and recovery](#failure-and-recovery) |
 | `netgear_plus_scrape_duration_seconds` | gauge | `switch` | time spent collecting |
 | `netgear_plus_raw_counters` | gauge | `switch` | 1 = unrounded parser path, 0 = rescaled fallback |
 | `netgear_plus_library_sample_interval_seconds` | gauge | `switch` | seconds between polls, as the library measures it; see below |
@@ -167,6 +167,29 @@ All configuration is environment variables. One container per switch.
 page renders (four on PoE models), and Prometheus may scrape more often than a
 device this small comfortably serves. Readings are served from cache in
 between.
+
+### Failure and recovery
+
+`netgear_plus_up` is **1 when the scrape produced a full reading**, which is
+not quite the same as "the switch answered". It also reports `0` when the
+switch answers but the counter path is lost mid-run, and when a defect in the
+exporter breaks metric construction. In all three the exposition carries
+`netgear_plus_up 0` and nothing else, which is the point: a partial reading
+would look like a healthy one.
+
+**Failures are cached like successes**, so an unreachable switch costs one
+attempt per interval rather than one per scrape, which matters because a poll
+against a dead switch can run for over a minute and would otherwise pile up.
+Two consequences before you alert on it:
+
+- `netgear_plus_up` lags a real recovery. The floor is one cache interval;
+  the actual wait is that plus the next Prometheus scrape plus the poll's own
+  duration, so size an alert's `for:` well above `NETGEAR_EXPORTER_CACHE_SECONDS`.
+- A scrape arriving while another is polling is served from cache rather than
+  made to wait, so a `1` can be republished from a reading slightly older than
+  the interval. It is never invented: with nothing cached yet the scrape
+  fails, and a cached *failure* is replayed as a failure even when an older
+  good reading is still held.
 
 ## Running
 
