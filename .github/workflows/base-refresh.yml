@@ -9,8 +9,9 @@ name: base-refresh
 #
 # Guarded by two conditions so it does not chase every upstream push:
 #   * a grace period, because a brand-new base tag is the least-tested one
-#   * a clean Docker Scout scan, so this never publishes a base that is worse
-#     than the one already shipped
+#   * a clean Docker Scout scan of the runtime image built on the new base,
+#     so this never publishes an image that is worse than the one already
+#     shipped
 #
 # Opens a PULL REQUEST rather than pushing to main: main requires status
 # checks, and a freshly pushed commit has none. The PR runs CI like any
@@ -100,22 +101,31 @@ jobs:
           fi
           echo "proceed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Log in to Docker Hub, so the CVE scan can pull the base image
+      - name: Log in to Docker Hub, so the build can pull the base image
         uses: docker/login-action@v4
         if: steps.grace.outputs.proceed == 'true'
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # The whole point of the rebuild is a cleaner base. If the new one carries
-      # critical or high findings, publishing it would make things worse, so the
-      # run stops and the existing release stays as it is.
-      - name: Refuse to publish a base with critical or high CVEs
+      # The scan target is what a release would publish, not the base itself.
+      # The Dockerfile uninstalls pip, so pip's vendored wheels (msgpack,
+      # setuptools) never ship; scanned on the raw base they read as findings
+      # in packages the published image does not contain, and held the refresh
+      # hostage to pip re-vendoring them.
+      - name: Build the runtime image on the new base
+        if: steps.grace.outputs.proceed == 'true'
+        run: docker build --pull -t netgear-plus-exporter:refresh-candidate .
+
+      # The whole point of the rebuild is a cleaner image. If the new one
+      # carries critical or high findings, publishing it would make things
+      # worse, so the run stops and the existing release stays as it is.
+      - name: Refuse to publish an image with critical or high CVEs
         if: steps.grace.outputs.proceed == 'true'
         uses: docker/scout-action@v1
         with:
           command: cves
-          image: ${{ env.BASE_IMAGE }}
+          image: local://netgear-plus-exporter:refresh-candidate
           only-severities: critical,high
           exit-code: true
 
@@ -150,12 +160,12 @@ jobs:
           git add pyproject.toml .base-image-digest \
             netgear_plus_exporter/__init__.py
           git commit -m "build: rebuild on refreshed ${BASE_IMAGE}" \
-                     -m "Base digest ${{ steps.base.outputs.digest }} is newer than the one the last release was built from, is past the ${GRACE_DAYS}-day grace period, and reports no critical or high CVEs."
+                     -m "Base digest ${{ steps.base.outputs.digest }} is newer than the one the last release was built from, is past the ${GRACE_DAYS}-day grace period, and the runtime image built on it reports no critical or high CVEs."
           git push origin "$branch"
           gh pr create \
             --base main --head "$branch" \
             --title "build: rebuild on refreshed ${BASE_IMAGE} (${{ steps.bump.outputs.version }})" \
-            --body "The base image moved, is past the ${GRACE_DAYS}-day grace period and scans clean.
+            --body "The base image moved, is past the ${GRACE_DAYS}-day grace period, and the runtime image built on it scans clean.
 
           Digest \`${{ steps.base.outputs.digest }}\`.
 
