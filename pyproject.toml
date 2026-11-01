@@ -19,7 +19,7 @@ classifiers = [
   "Topic :: System :: Monitoring",
 ]
 dependencies = [
-  "py-netgear-plus==0.6.4",
+  "py-netgear-plus==0.7.0",
   "prometheus-client==0.26.0",
 ]
 
